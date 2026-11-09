@@ -1,0 +1,10 @@
+# identity-map - commit identity per GitHub org of the origin remote.
+#
+# One line per org: <org> <email> <name>. The name may carry <Model>,
+# replaced by $HOW_GIT_MODEL (or the model named in $ANTHROPIC_MODEL)
+# so the author name stamps the authoring model. Lookup order:
+# $HOW_GIT_IDENTITY_MAP, then identity-map.local (consumer-owned,
+# never synced), then this file. See bin/identity --help.
+v4rian-io      v4rian-waylon@users.noreply.github.com  v4rian-waylon (<Model>)
+v4rian-waylon  v4rian-waylon@users.noreply.github.com  v4rian-waylon (<Model>)
+sessionpass    waylon@sessionpass.io                   waylon-sp

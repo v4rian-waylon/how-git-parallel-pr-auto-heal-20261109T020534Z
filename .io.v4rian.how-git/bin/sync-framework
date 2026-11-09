@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# sync-framework - operator-run wrapper for the vendored framework migration.
+#
+# Thin shim that locates the canonical script under scripts/ and forwards
+# every argument verbatim, matching the bin/ vs scripts/ split the rest of
+# the framework uses. The pass migrates a consumer repo's vendored framework
+# copy to any framework source revision, up or down, with consumer owned
+# state excluded from the migration diff and the SPEC restamped to the
+# target on a clean apply.
+#
+#   .io.v4rian.how-git/bin/sync-framework --help
+#   .io.v4rian.how-git/bin/sync-framework v2026.0.9 --dry-run
+#   .io.v4rian.how-git/bin/sync-framework v2026.0.9
+set -euo pipefail
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec bash "$SCRIPT_DIR/../scripts/sync-framework.sh" "$@"

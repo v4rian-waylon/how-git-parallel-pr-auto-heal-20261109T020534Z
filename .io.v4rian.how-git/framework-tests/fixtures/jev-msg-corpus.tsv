@@ -1,0 +1,205 @@
+# jev message corpus: the 200 subjects bench-results/jev/bench_msg.py seeds
+# (python random.seed(7)), 61 of them violations: no tag, an unknown tag,
+# lowercase after the tag, over 100 chars, under 8 chars. One per line:
+# <ok|bad><TAB><subject>; each message gets the body
+# "Description paragraph explaining why." under it.
+ok	[NEW] Allocator reads vault refs 0
+ok	[FIX] Guard empty args on bash 3.2 1
+ok	[TEST] Cover claim dry run 2
+ok	[TEST] Cover claim dry run 3
+ok	[TEST] Cover claim dry run 4
+ok	[FIX] Guard empty args on bash 3.2 5
+ok	[FIX] Guard empty args on bash 3.2 6
+ok	[TEST] Cover claim dry run 7
+ok	[TEST] Cover claim dry run 8
+ok	[NEW] Allocator reads vault refs 9
+ok	[TEST] Cover claim dry run 10
+bad	[FIX] x
+ok	[FIX] Guard empty args on bash 3.2 12
+bad	fix stuff
+ok	[NEW] Allocator reads vault refs 14
+ok	[NEW] Allocator reads vault refs 15
+ok	[TEST] Cover claim dry run 16
+ok	[NEW] Allocator reads vault refs 17
+ok	[TEST] Cover claim dry run 18
+ok	[REFACTOR] Share branch regex in lib 19
+ok	[FIX] Guard empty args on bash 3.2 20
+ok	[TEST] Cover claim dry run 21
+ok	[TEST] Cover claim dry run 22
+ok	[REFACTOR] Share branch regex in lib 23
+ok	[DOCS] Document warp mode 24
+ok	[NEW] Allocator reads vault refs 25
+bad	Add feature and fix bug
+bad	fix stuff
+ok	[TEST] Cover claim dry run 28
+ok	[REFACTOR] Share branch regex in lib 29
+bad	[FIX] lowercase start? no: guard args
+ok	[FIX] Guard empty args on bash 3.2 31
+ok	[DOCS] Document warp mode 32
+ok	[REFACTOR] Share branch regex in lib 33
+ok	[DOCS] Document warp mode 34
+ok	[FIX] Guard empty args on bash 3.2 35
+bad	[FIX] x
+bad	[FIX] lowercase start? no: guard args
+ok	[REFACTOR] Share branch regex in lib 38
+ok	[TEST] Cover claim dry run 39
+bad	fix stuff
+bad	[FIX] lowercase start? no: guard args
+ok	[FIX] Guard empty args on bash 3.2 42
+ok	[REFACTOR] Share branch regex in lib 43
+ok	[DOCS] Document warp mode 44
+ok	[DOCS] Document warp mode 45
+bad	[FIX] lowercase start? no: guard args
+ok	[DOCS] Document warp mode 47
+ok	[TEST] Cover claim dry run 48
+ok	[FIX] Guard empty args on bash 3.2 49
+ok	[REFACTOR] Share branch regex in lib 50
+ok	[NEW] Allocator reads vault refs 51
+ok	[DOCS] Document warp mode 52
+ok	[DOCS] Document warp mode 53
+ok	[REFACTOR] Share branch regex in lib 54
+bad	[NEW] Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject 
+bad	[FIX] lowercase start? no: guard args
+bad	[FIX] lowercase start? no: guard args
+ok	[DOCS] Document warp mode 58
+bad	[CLEANUP] Remove dead code
+ok	[NEW] Allocator reads vault refs 60
+ok	[NEW] Allocator reads vault refs 61
+ok	[TEST] Cover claim dry run 62
+ok	[REFACTOR] Share branch regex in lib 63
+ok	[DOCS] Document warp mode 64
+ok	[TEST] Cover claim dry run 65
+ok	[NEW] Allocator reads vault refs 66
+ok	[TEST] Cover claim dry run 67
+bad	Add feature and fix bug
+ok	[FIX] Guard empty args on bash 3.2 69
+ok	[TEST] Cover claim dry run 70
+ok	[DOCS] Document warp mode 71
+ok	[DOCS] Document warp mode 72
+ok	[FIX] Guard empty args on bash 3.2 73
+ok	[NEW] Allocator reads vault refs 74
+ok	[FIX] Guard empty args on bash 3.2 75
+ok	[FIX] Guard empty args on bash 3.2 76
+ok	[TEST] Cover claim dry run 77
+ok	[FIX] Guard empty args on bash 3.2 78
+bad	[FIX] x
+ok	[NEW] Allocator reads vault refs 80
+ok	[NEW] Allocator reads vault refs 81
+ok	[REFACTOR] Share branch regex in lib 82
+ok	[DOCS] Document warp mode 83
+ok	[DOCS] Document warp mode 84
+bad	[NEW] Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject 
+ok	[REFACTOR] Share branch regex in lib 86
+ok	[FIX] Guard empty args on bash 3.2 87
+bad	Add feature and fix bug
+ok	[NEW] Allocator reads vault refs 89
+ok	[NEW] Allocator reads vault refs 90
+bad	[FIX] x
+ok	[TEST] Cover claim dry run 92
+bad	[FIX] x
+ok	[FIX] Guard empty args on bash 3.2 94
+ok	[REFACTOR] Share branch regex in lib 95
+ok	[NEW] Allocator reads vault refs 96
+ok	[NEW] Allocator reads vault refs 97
+ok	[TEST] Cover claim dry run 98
+ok	[NEW] Allocator reads vault refs 99
+ok	[NEW] Allocator reads vault refs 100
+bad	[NEW] Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject 
+bad	[CLEANUP] Remove dead code
+ok	[DOCS] Document warp mode 103
+ok	[FIX] Guard empty args on bash 3.2 104
+bad	[FIX] lowercase start? no: guard args
+ok	[NEW] Allocator reads vault refs 106
+ok	[REFACTOR] Share branch regex in lib 107
+ok	[REFACTOR] Share branch regex in lib 108
+bad	[FIX] lowercase start? no: guard args
+ok	[FIX] Guard empty args on bash 3.2 110
+ok	[NEW] Allocator reads vault refs 111
+ok	[DOCS] Document warp mode 112
+ok	[TEST] Cover claim dry run 113
+bad	[NEW] Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject 
+bad	[FIX] lowercase start? no: guard args
+bad	fix stuff
+bad	fix stuff
+bad	Add feature and fix bug
+bad	[NEW] Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject 
+bad	[NEW] Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject 
+bad	[FIX] lowercase start? no: guard args
+ok	[DOCS] Document warp mode 122
+ok	[FIX] Guard empty args on bash 3.2 123
+bad	[CLEANUP] Remove dead code
+bad	fix stuff
+ok	[DOCS] Document warp mode 126
+bad	[CLEANUP] Remove dead code
+ok	[TEST] Cover claim dry run 128
+bad	Add feature and fix bug
+bad	[CLEANUP] Remove dead code
+ok	[NEW] Allocator reads vault refs 131
+ok	[FIX] Guard empty args on bash 3.2 132
+ok	[NEW] Allocator reads vault refs 133
+ok	[NEW] Allocator reads vault refs 134
+bad	[CLEANUP] Remove dead code
+ok	[NEW] Allocator reads vault refs 136
+ok	[NEW] Allocator reads vault refs 137
+bad	[FIX] lowercase start? no: guard args
+ok	[DOCS] Document warp mode 139
+bad	fix stuff
+bad	[FIX] lowercase start? no: guard args
+bad	Add feature and fix bug
+ok	[TEST] Cover claim dry run 143
+ok	[TEST] Cover claim dry run 144
+ok	[NEW] Allocator reads vault refs 145
+ok	[FIX] Guard empty args on bash 3.2 146
+bad	[CLEANUP] Remove dead code
+ok	[NEW] Allocator reads vault refs 148
+ok	[DOCS] Document warp mode 149
+ok	[FIX] Guard empty args on bash 3.2 150
+ok	[REFACTOR] Share branch regex in lib 151
+ok	[TEST] Cover claim dry run 152
+ok	[FIX] Guard empty args on bash 3.2 153
+bad	fix stuff
+ok	[REFACTOR] Share branch regex in lib 155
+ok	[FIX] Guard empty args on bash 3.2 156
+ok	[TEST] Cover claim dry run 157
+ok	[FIX] Guard empty args on bash 3.2 158
+ok	[TEST] Cover claim dry run 159
+bad	[FIX] x
+ok	[REFACTOR] Share branch regex in lib 161
+ok	[TEST] Cover claim dry run 162
+bad	[FIX] x
+bad	Add feature and fix bug
+ok	[REFACTOR] Share branch regex in lib 165
+bad	[CLEANUP] Remove dead code
+bad	[CLEANUP] Remove dead code
+ok	[DOCS] Document warp mode 168
+ok	[FIX] Guard empty args on bash 3.2 169
+ok	[DOCS] Document warp mode 170
+ok	[REFACTOR] Share branch regex in lib 171
+bad	[CLEANUP] Remove dead code
+bad	Add feature and fix bug
+ok	[NEW] Allocator reads vault refs 174
+ok	[NEW] Allocator reads vault refs 175
+bad	[CLEANUP] Remove dead code
+bad	fix stuff
+ok	[DOCS] Document warp mode 178
+ok	[NEW] Allocator reads vault refs 179
+ok	[DOCS] Document warp mode 180
+bad	[NEW] Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject Very long subject 
+ok	[NEW] Allocator reads vault refs 182
+ok	[FIX] Guard empty args on bash 3.2 183
+bad	fix stuff
+ok	[DOCS] Document warp mode 185
+ok	[FIX] Guard empty args on bash 3.2 186
+ok	[TEST] Cover claim dry run 187
+ok	[TEST] Cover claim dry run 188
+bad	fix stuff
+bad	[CLEANUP] Remove dead code
+bad	fix stuff
+ok	[REFACTOR] Share branch regex in lib 192
+ok	[NEW] Allocator reads vault refs 193
+ok	[NEW] Allocator reads vault refs 194
+bad	Add feature and fix bug
+bad	[FIX] lowercase start? no: guard args
+ok	[TEST] Cover claim dry run 197
+bad	[FIX] x
+ok	[REFACTOR] Share branch regex in lib 199

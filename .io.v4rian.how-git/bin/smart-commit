@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# smart-commit - hand the staged diff to a sub-claude that composes the
+# commit message per the in-repo audit skills, then commits with that
+# message via the framework's normal hook chain.
+#
+# Purpose:
+#
+#   how-git's big objective is to fill in smartly via claude commits. This
+#   tool is the user-facing entry point. It looks ONLY at the staged scope
+#   (or, when nothing is staged, assumes the entire unstaged working tree
+#   is the commit's intent and stages it for you), composes a sub-claude
+#   prompt that wraps the staged diff with references to the in-repo audit
+#   skills (git-commit-audit + git-strategy-audit + git-merge-audit per
+#   applicability), spawns a FRESH claude subprocess (-p / print mode) so
+#   the parent caller's context window stays uncontaminated, captures the
+#   returned commit message, and runs `git commit -F "$MSG_FILE"` so the
+#   pre-commit / prepare-commit-msg / commit-msg hooks fire normally.
+#
+# Sub-process isolation:
+#
+#   The "ANOTHER layer you will peel back from your own doing" idea is the
+#   whole reason this exists. The calling claude (you, when you invoke
+#   `smart-commit`) does NOT need to load the audit skills, parse the
+#   staged diff, or hand-compose the message. You delegate to a fresh
+#   subprocess that loads everything it needs in its own conversation,
+#   returns ONLY the message, and exits. The parent conversation stays
+#   light, the audit lens is still applied per the in-repo standards, and
+#   the same tool works from a human terminal where there is no parent
+#   claude conversation at all.
+#
+# Behavior:
+#
+#   1. Detect staged scope via `git diff --cached --name-only`.
+#      a. If non-empty: that IS the commit scope; do nothing further to
+#         the index.
+#      b. If empty AND `git diff --name-only` (unstaged tracked) plus
+#         `git ls-files --others --exclude-standard` (untracked, .gitignore
+#         respected) together are non-empty: ALL of those are the assumed
+#         scope; stage them by name (never `git add .` / `git add -A`).
+#      c. If still nothing to commit: exit 1 with a friendly message.
+#
+#   2. Build a sub-claude prompt that includes:
+#       - The exact staged diff (`git diff --cached`).
+#       - The list of staged file paths.
+#       - The branch name + repo root so the sub-claude knows context.
+#       - References (BY PATH, not inlined) to the in-repo audit skills:
+#           .io.v4rian.how-git/skills/git-commit-audit/SKILL.md
+#           .io.v4rian.how-git/skills/git-strategy-audit/SKILL.md
+#           .io.v4rian.how-git/skills/git-merge-audit/SKILL.md
+#       - The lane's requirement text, resolved by get-active-requirement.sh
+#         (the lane's requirements/ file, else the [REQ] commit); skipped
+#         gracefully when the lane has none.
+#       - Explicit instruction: apply the audit lenses, compose ONLY the
+#         commit message body (title + blank line + description paragraph +
+#         optional Changes block), no Co-Authored-By trailer, no em-dashes,
+#         no fabricated JIRA codes, no preamble or trailing commentary -
+#         just the raw commit message, ready for `git commit -F`.
+#
+#   3. Invoke `claude -p` with the prompt on stdin, capture stdout.
+#
+#   4. Run `git commit -F "$MSG_FILE"`. The framework's pre-commit /
+#      prepare-commit-msg / commit-msg hooks fire normally (em-dash scrub,
+#      auto-fix, subject-length guardrail).
+#
+#   5. On success, print the resulting SHA and a one-line audit note.
+#
+# Usage:
+#
+#   smart-commit [-m | -n] [-y]
+#   smart-commit -h | --help
+#
+# Flags:
+#
+#   -m, --message-only   Print the composed message to stdout, do NOT
+#                        commit. Useful for previewing what the sub-claude
+#                        would write.
+#   -n, --dry-run        Compose + print the message AND show the proposed
+#                        `git commit -F` line, but do not execute it.
+#   -y, --yes            Skip the confirmation prompt before committing
+#                        (useful from non-interactive callers).
+#   -h, --help           Print this help.
+#
+# Env:
+#
+#   LIFECYCLE_TEST_MODE=1   Bypass the real `claude -p` call. Instead,
+#                           emit a canned commit message derived from the
+#                           staged file list. Mirrors the test-mode
+#                           pattern every other framework script uses; the
+#                           lifecycle suite drives this path.
+#
+#   SMART_COMMIT_CLAUDE_BIN  Override the claude binary path. Defaults to
+#                            `claude` resolved on PATH. Used by tests that
+#                            want to substitute a stub.
+#
+# User-space override / expansion: smart-commit resolves every audit skill
+# through _lib.sh::resolve_skill, so a per-user ~/.config/how-git/skills/
+# tree (HOW_GIT_USER_SKILLS_DIR to relocate) replaces any in-repo skill by
+# name, and list_user_extra_skills merges user-only skills into the set the
+# sub-claude is pointed at.
+#
+# Exit codes:
+#
+#   0  committed, printed (-m / -n), cancelled at the prompt, or --help
+#   1  nothing to commit, or auto-staging produced an empty index
+#   2  not inside a git repo, or an unknown flag
+#   3  the claude binary is not on PATH (set SMART_COMMIT_CLAUDE_BIN)
+#   4  the sub-claude call failed
+#   5  the composed message is empty
+#   N  git commit's own exit code when a hook refused the commit
+
+set -uo pipefail
+
+# --help works anywhere, before the repo check below.
+for _arg in "$@"; do
+  case "$_arg" in -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;; esac
+done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X smart-commit: not inside a git repo" >&2
+  exit 2
+fi
+
+# Sourced (not executed) for resolve_skill + list_user_extra_skills; the
+# library fires no side effects on source.
+# shellcheck source=../scripts/_lib.sh
+. "$REPO_ROOT/.io.v4rian.how-git/scripts/_lib.sh"
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0; }
+
+MESSAGE_ONLY=false
+DRY_RUN=false
+ASSUME_YES=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--message-only) MESSAGE_ONLY=true; shift ;;
+    -n|--dry-run)      DRY_RUN=true; shift ;;
+    -y|--yes)          ASSUME_YES=true; shift ;;
+    -h|--help)         usage ;;
+    *) echo "X smart-commit: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+cd "$REPO_ROOT"
+
+# ---------------------------------------------------------------------------
+# Step 1: Determine commit scope. Staged wins; otherwise auto-stage all
+# unstaged tracked changes + every untracked file the .gitignore allows.
+# ---------------------------------------------------------------------------
+
+STAGED=$(git diff --cached --name-only 2>/dev/null)
+
+if [ -z "$STAGED" ]; then
+  UNSTAGED_TRACKED=$(git diff --name-only 2>/dev/null)
+  UNTRACKED=$(git ls-files --others --exclude-standard 2>/dev/null)
+  if [ -z "$UNSTAGED_TRACKED" ] && [ -z "$UNTRACKED" ]; then
+    echo "X smart-commit: nothing to commit (no staged, no unstaged, no untracked)" >&2
+    exit 1
+  fi
+  echo ">> smart-commit: no staged scope; assuming ALL unstaged + untracked changes" >&2
+  # Stage by name. Never `git add .` / `git add -A`.
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    git add -- "$f" >/dev/null 2>&1 || true
+  done <<EOF
+$UNSTAGED_TRACKED
+$UNTRACKED
+EOF
+  STAGED=$(git diff --cached --name-only 2>/dev/null)
+  if [ -z "$STAGED" ]; then
+    echo "X smart-commit: auto-stage produced an empty index; aborting" >&2
+    exit 1
+  fi
+fi
+
+STAGED_COUNT=$(printf '%s\n' "$STAGED" | sed '/^$/d' | wc -l | tr -d ' ')
+echo ">> smart-commit: $STAGED_COUNT file(s) in scope:" >&2
+printf '%s\n' "$STAGED" | sed 's/^/   /' >&2
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "(detached)")
+
+# ---------------------------------------------------------------------------
+# Step 2: Compose the sub-claude prompt. The prompt is plain text. It
+# references the audit skills BY PATH (not inlined) so the sub-claude is
+# the one paying the token cost of reading them, not the caller.
+# ---------------------------------------------------------------------------
+
+SKILL_COMMIT_AUDIT=$(resolve_skill git-commit-audit)
+SKILL_STRATEGY_AUDIT=$(resolve_skill git-strategy-audit)
+SKILL_MERGE_AUDIT=$(resolve_skill git-merge-audit)
+USER_EXTRA_SKILLS=$(list_user_extra_skills)
+# The lane's requirement, resolved the same way every tool does (per-lane
+# file, then the [REQ] commit body, then the legacy shared file).
+ACTIVE_REQ_TEXT=$(bash "$REPO_ROOT/.io.v4rian.how-git/scripts/get-active-requirement.sh" HEAD 2>/dev/null || true)
+
+PROMPT_FILE=$(mktemp -t smart-commit-prompt.XXXXXX)
+DIFF_FILE=$(mktemp -t smart-commit-diff.XXXXXX)
+MSG_FILE=$(mktemp -t smart-commit-msg.XXXXXX)
+trap 'rm -f "$PROMPT_FILE" "$DIFF_FILE" "$MSG_FILE"' EXIT
+
+git diff --cached > "$DIFF_FILE" 2>/dev/null
+
+{
+  echo "You are composing the commit message for a v4rian-model git commit."
+  echo ""
+  echo "Repo root: $REPO_ROOT"
+  echo "Current branch: $BRANCH"
+  echo "Staged file count: $STAGED_COUNT"
+  echo ""
+  echo "Staged files:"
+  printf '%s\n' "$STAGED" | sed 's/^/  - /'
+  echo ""
+  echo "Audit skills to apply (read each one before composing):"
+  [ -f "$SKILL_COMMIT_AUDIT" ]   && echo "  - $SKILL_COMMIT_AUDIT"
+  [ -f "$SKILL_STRATEGY_AUDIT" ] && echo "  - $SKILL_STRATEGY_AUDIT"
+  [ -f "$SKILL_MERGE_AUDIT" ]    && echo "  - $SKILL_MERGE_AUDIT"
+  if [ -n "$USER_EXTRA_SKILLS" ]; then
+    printf '%s\n' "$USER_EXTRA_SKILLS" | sed 's/^/  - /'
+  fi
+  echo ""
+  if [ -n "$ACTIVE_REQ_TEXT" ]; then
+    echo "Active requirement (caller's stated intent for this commit):"
+    printf '%s\n' "$ACTIVE_REQ_TEXT" | sed 's/^/  /'
+    echo ""
+  fi
+  echo "Staged diff (this is the EXACT scope of the commit):"
+  echo ""
+  echo "===== BEGIN STAGED DIFF ====="
+  cat "$DIFF_FILE"
+  echo "===== END STAGED DIFF ====="
+  echo ""
+  echo "Task:"
+  echo ""
+  echo "  Apply the audit lenses above. Compose a commit message per the v4rian"
+  echo "  standards. Required shape:"
+  echo ""
+  echo "    [TAG] Title in sentence case (<=72 chars, approved tags only:"
+  echo "          [FIX] [NEW] [REFACTOR] [DOCS] [TEST] [REVERT] [HOTFIX] [MERGE])"
+  echo "    <blank line>"
+  echo "    1-3 sentence general description paragraph at subsystem altitude."
+  echo "    <blank line, then optional bullets per git-commit-audit section D>"
+  echo ""
+  echo "  Rules to enforce:"
+  echo "    - No Co-Authored-By trailer."
+  echo "    - No em-dashes (-) or en-dashes; hyphens in identifiers are fine."
+  echo "    - No fabricated JIRA codes (omit when none was supplied)."
+  echo "    - No 'plus' word. No 'Merge' word in titles that already use [MERGE]."
+  echo "    - Tag must reflect the diff: new files / new subsystem = [NEW];"
+  echo "      bug fix = [FIX] (with Cause: / Fix: blocks); existing-feature"
+  echo "      enhancement = [REFACTOR]; doc-only change = [DOCS]."
+  echo "    - Bullets describe class/function/method symbols only, third-person"
+  echo "      present tense (Normalizes, Sends, Schedules); never fields or"
+  echo "      properties; never constructors."
+  echo "    - Do NOT run git commit yourself. The calling shell will."
+  echo ""
+  echo "  Output:"
+  echo ""
+  echo "    Print ONLY the raw commit message body to stdout. No preamble,"
+  echo "    no trailing commentary, no markdown code fences. The first line"
+  echo "    is the title; subsequent lines are the body. This output will be"
+  echo "    fed directly to 'git commit -F'."
+} > "$PROMPT_FILE"
+
+# ---------------------------------------------------------------------------
+# Step 3: Invoke the sub-claude (or the lifecycle-test fake) and capture
+# the message.
+# ---------------------------------------------------------------------------
+
+if [ "${LIFECYCLE_TEST_MODE:-}" = "1" ]; then
+  # Test-mode canned message. Mirrors what the real sub-claude would
+  # produce in shape (title + blank + description) so downstream hooks
+  # (pre-commit em-dash scrub, prepare-commit-msg auto-fix, commit-msg
+  # length guardrail) all see a well-formed input. Tag is derived from
+  # the diff shape exactly the way the shared auto-fix lib does it:
+  # new files present in the staged set => [NEW], else [REFACTOR].
+  NEW_FILE_PRESENT=false
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if ! git ls-tree HEAD -- "$f" >/dev/null 2>&1 || [ -z "$(git ls-tree HEAD -- "$f" 2>/dev/null)" ]; then
+      NEW_FILE_PRESENT=true
+      break
+    fi
+  done <<EOF
+$STAGED
+EOF
+  if $NEW_FILE_PRESENT; then
+    CANNED_TAG="[NEW]"
+  else
+    CANNED_TAG="[REFACTOR]"
+  fi
+  FIRST_FILE=$(printf '%s\n' "$STAGED" | head -1)
+  {
+    printf '%s Smart commit composed by test-mode fake claude for %s\n' "$CANNED_TAG" "$FIRST_FILE"
+    printf '\n'
+    printf 'Test-mode canned description paragraph covering %d staged file(s) under the smart-commit lifecycle path. The sub-claude isolation pattern routes through this branch when LIFECYCLE_TEST_MODE is set so the offline lifecycle suite can exercise the staged-vs-unstaged auto-stage rule and the commit pipeline without making a network call.\n' "$STAGED_COUNT"
+  } > "$MSG_FILE"
+  echo ">> smart-commit: LIFECYCLE_TEST_MODE=1 used canned message (no claude call)" >&2
+else
+  CLAUDE_BIN="${SMART_COMMIT_CLAUDE_BIN:-claude}"
+  if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+    echo "X smart-commit: '$CLAUDE_BIN' not found on PATH" >&2
+    echo "   set SMART_COMMIT_CLAUDE_BIN=<path-to-claude>, or install the claude CLI" >&2
+    exit 3
+  fi
+  echo ">> smart-commit: spawning sub-claude (fresh subprocess; parent context preserved)" >&2
+  # -p / --print runs in non-interactive print mode. The prompt is piped
+  # on stdin so we don't bloat argv with a multi-KB diff.
+  if ! "$CLAUDE_BIN" -p < "$PROMPT_FILE" > "$MSG_FILE" 2>/dev/null; then
+    echo "X smart-commit: sub-claude invocation failed" >&2
+    exit 4
+  fi
+fi
+
+# Trim leading/trailing blank lines and any markdown code-fence the
+# sub-claude might have wrapped its output in (defensive: the prompt asks
+# for raw text but we shouldn't break on accidental fencing).
+python3 - "$MSG_FILE" <<'PY'
+import sys, re
+p = sys.argv[1]
+with open(p, 'r', encoding='utf-8', errors='replace') as f:
+    s = f.read()
+# Strip ```...``` fences if the entire payload is wrapped in one.
+m = re.match(r'^\s*```[a-zA-Z0-9_-]*\s*\n(.*?)\n```\s*$', s, re.DOTALL)
+if m:
+    s = m.group(1)
+# Trim outer blank lines.
+s = s.strip() + '\n'
+with open(p, 'w', encoding='utf-8') as f:
+    f.write(s)
+PY
+
+if [ ! -s "$MSG_FILE" ]; then
+  echo "X smart-commit: composed message is empty" >&2
+  exit 5
+fi
+
+# ---------------------------------------------------------------------------
+# Step 4: Preview + dispatch.
+# ---------------------------------------------------------------------------
+
+if $MESSAGE_ONLY; then
+  cat "$MSG_FILE"
+  exit 0
+fi
+
+echo ""
+echo "----- composed commit message -----"
+sed 's/^/  /' "$MSG_FILE"
+echo "----- end composed commit message -----"
+echo ""
+
+if $DRY_RUN; then
+  echo ">> smart-commit: --dry-run; not committing"
+  echo "   would run: git commit -F <composed-message>"
+  exit 0
+fi
+
+if ! $ASSUME_YES && [ -t 0 ]; then
+  printf '   commit with this message? [Y/n] '
+  read -r ans
+  case "$ans" in
+    n|N|no|NO) echo "cancelled"; exit 0 ;;
+  esac
+fi
+
+# Use -F (file) instead of -m so multi-line messages survive intact and
+# the framework's hooks see the full body.
+git commit -F "$MSG_FILE"
+RC=$?
+if [ "$RC" -ne 0 ]; then
+  echo "X smart-commit: git commit exited $RC" >&2
+  exit "$RC"
+fi
+
+SHA=$(git rev-parse --short=12 HEAD)
+TITLE=$(git log -1 --format=%s HEAD)
+echo ""
+echo "ok: smart-commit landed $SHA - $TITLE"
+exit 0

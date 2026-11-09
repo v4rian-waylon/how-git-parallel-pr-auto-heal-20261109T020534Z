@@ -1,0 +1,5 @@
+# Marker file. Presence (not content) indicates this repo is the how-git framework source.
+# Consumer repos do not carry this file; framework code gates internal-test runners on its
+# presence so consumers do not execute framework-internal suites. Content is intentionally
+# not parsed and intentionally not an owner/repo literal: the framework derives any repo
+# identity it needs from `git config --get remote.origin.url` at runtime.

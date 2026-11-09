@@ -1,0 +1,30 @@
+{
+  "_comment": "v4rian vault/* freeze. Creation is OPEN so the CI claim vaults merged pools with its plain workflow token (the carve out: a vault ref is immutable the instant it exists, so an unexpected creator is inert noise the provenance audit flags). Update and deletion are locked: vaults are frozen institutional memory. Bypass actors: repository admins only. Apply via .io.v4rian.how-git/scripts/apply-repo-rules.sh.",
+  "name": "v4rian-vault-readonly",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/heads/vault/*",
+        "refs/heads/vault/*/*"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "update"
+    },
+    {
+      "type": "deletion"
+    }
+  ],
+  "bypass_actors": [
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
+    }
+  ]
+}

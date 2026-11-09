@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# claude-shim - stands in for `claude` on the PATH of every benchmark sandbox.
+#
+# The framework's git hooks call `claude -p` for AI audits (post-checkout,
+# commit audit, smart-commit). Those nested calls are protocol cost, so the
+# benchmark meters them instead of letting them vanish from the totals.
+#
+#   BENCH_CLAUDE_MODE=stub   fixture building and --dry: print AUDIT_PASS, no model call.
+#   BENCH_CLAUDE_MODE=meter  agent runs: forward to the real CLI (BENCH_REAL_CLAUDE)
+#                            with --output-format json, append one usage line to
+#                            BENCH_NESTED_LOG, print only the result text, exactly
+#                            as a plain `claude -p` would.
+# Non-print invocations (no -p/--print) are forwarded untouched in meter mode.
+
+mode="${BENCH_CLAUDE_MODE:-stub}"
+if [ "$mode" = "stub" ]; then
+  [ -n "${BENCH_NESTED_LOG:-}" ] && printf '{"stub":true,"argc":%d}\n' "$#" >> "$BENCH_NESTED_LOG"
+  echo "AUDIT_PASS"
+  exit 0
+fi
+
+real="${BENCH_REAL_CLAUDE:?BENCH_REAL_CLAUDE unset}"
+is_print=0; has_fmt=0; has_model=0
+for a in "$@"; do
+  case "$a" in
+    -p|--print) is_print=1 ;;
+    --output-format|--output-format=*) has_fmt=1 ;;
+    --model|--model=*) has_model=1 ;;
+  esac
+done
+if [ "$is_print" = 0 ] || [ "$has_fmt" = 1 ]; then
+  exec "$real" "$@"
+fi
+
+extra=(--output-format json --no-session-persistence)
+[ "$has_model" = 0 ] && [ -n "${BENCH_NESTED_MODEL:-}" ] && extra+=(--model "$BENCH_NESTED_MODEL")
+out=$(mktemp "${TMPDIR:-/tmp}/shim.XXXXXX")
+start=$(date +%s)
+"$real" "$@" "${extra[@]}" > "$out"
+rc=$?
+end=$(date +%s)
+"${BENCH_PYTHON:-python3}" - "$out" "$rc" "$((end - start))" "${BENCH_NESTED_LOG:-/dev/null}" "$PWD" <<'PY'
+import json, sys
+path, rc, secs, log, cwd = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+raw = open(path, encoding="utf-8", errors="replace").read()
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.stdout.write(raw)
+    rec = {"rc": rc, "seconds": secs, "parse_error": True}
+else:
+    sys.stdout.write((d.get("result") or "") + "\n")
+    rec = {"rc": rc, "seconds": secs, "cwd": cwd, "is_error": d.get("is_error"),
+           "num_turns": d.get("num_turns"), "total_cost_usd": d.get("total_cost_usd"),
+           "usage": {k: d.get("usage", {}).get(k, 0) for k in
+                     ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")},
+           "modelUsage": d.get("modelUsage", {})}
+with open(log, "a") as f:
+    f.write(json.dumps(rec) + "\n")
+PY
+rm -f "$out"
+exit "$rc"

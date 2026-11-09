@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# ci-local - run the layered CI tree locally, without GitHub.
+#
+# Local equivalent of the ci-dispatch workflow (.github/workflows/
+# ci-dispatch.yml) for repos with CI off: off-grid mode, no remote,
+# or a fork where Actions is disabled. It enumerates the same
+# ci/{tests,audits}/{trigger}/ scripts the workflow's resolve job
+# discovers (via scripts/workflows/ci-dispatch.sh --list) and runs
+# each one from the repo root with the same env contract the
+# workflow's check job sets:
+#   CI_TRIGGER, CI_LAYER, CI_KIND, CI_CHECK_NAME, CI_REQUIRED
+# (CI_REQUIRED is true when the script basename starts with
+# 'required.', else false - same derivation as the dispatcher).
+#
+# Advisory (non-required) failures are reported but not fatal; the
+# exit code reflects required checks only, matching the branch
+# protection semantics the GitHub side enforces.
+#
+# Usage:
+#   ci-local                                    run push-trigger tree
+#   ci-local --trigger <t>                      push | pr-open | pr-merge-dev |
+#                                               pr-merge-main | tag (default push)
+#   ci-local --kind <tests|audits>              run one kind only (default both)
+#   ci-local --only <check-name>                run a single check by name
+#                                               (basename without .sh)
+#   ci-local --workflow <name>                  run what .github/workflows/<name>.yml
+#                                               runs on GitHub: a thin entry that
+#                                               calls ci-dispatch.yml (audit-pushed-
+#                                               branch, dev-merge, main-merge,
+#                                               build-on-tag) resolves to the
+#                                               trigger it passes; ci-dispatch
+#                                               itself needs --trigger
+#   ci-local --list                             enumerate selected checks and exit
+#   ci-local --allow-claim                      also run the claim checks (required.claim
+#                                               or a consumer claim.sh under pr-merge-dev
+#                                               and pr-merge-main). A claim is a live
+#                                               operation: it amends, tags and force-
+#                                               pushes dev or main. Without this flag
+#                                               ci-local never runs one: each is listed
+#                                               as SKIP, is no failure, and --only claim
+#                                               is refused. Never pass it as a pre-merge
+#                                               check; only to repeat a failed claim.
+#   ci-local --archive                          after the run, record the verdict
+#                                               chain as a commit on the custom ref
+#                                               refs/v4rian/ci-log and push it to
+#                                               origin when reachable. The ref lives
+#                                               outside refs/heads and refs/tags, so
+#                                               the push can NEVER trigger workflows
+#                                               (Actions fire on branch and tag
+#                                               events only) - archival without CI.
+#   ci-local -h | --help                        print this help
+#
+# Trigger tag: TAG names the tag being built; when unset, ci-local takes
+# the v* tag pointing at HEAD (check the tag out first) and refuses when
+# there is none.
+#
+# Exits 0 when every required check passed, 1 when any required
+# check failed, 2 on usage errors.
+
+set -euo pipefail
+
+# Help is the whole leading comment block, so it never drifts from the text.
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0; }
+
+case "${1:-}" in -h|--help) usage ;; esac
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X ci-local: not inside a git repo" >&2
+  exit 2
+fi
+
+DISPATCH="$REPO_ROOT/.io.v4rian.how-git/scripts/workflows/ci-dispatch.sh"
+if [ ! -f "$DISPATCH" ]; then
+  echo "X ci-local: dispatcher not found at $DISPATCH" >&2
+  exit 2
+fi
+
+TRIGGER="push"
+KIND="both"
+ONLY=""
+LIST=false
+ARCHIVE=false
+WORKFLOW=""
+TRIGGER_SET=false
+ALLOW_CLAIM=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --trigger) TRIGGER="$2"; TRIGGER_SET=true; shift 2 ;;
+    --workflow) WORKFLOW="$2"; shift 2 ;;
+    --kind)    KIND="$2"; shift 2 ;;
+    --only)    ONLY="$2"; shift 2 ;;
+    --list)    LIST=true; shift ;;
+    --archive) ARCHIVE=true; shift ;;
+    --allow-claim) ALLOW_CLAIM=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "X ci-local: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+
+# --workflow: read the trigger from the thin entry's `with: trigger:` so
+# the workflow file stays the single source of the mapping.
+if [ -n "$WORKFLOW" ]; then
+  if $TRIGGER_SET; then
+    echo "X ci-local: --workflow and --trigger are exclusive" >&2
+    exit 2
+  fi
+  wf_file=""
+  for ext in yml yaml; do
+    [ -f "$REPO_ROOT/.github/workflows/$WORKFLOW.$ext" ] && wf_file="$REPO_ROOT/.github/workflows/$WORKFLOW.$ext" && break
+  done
+  if [ -z "$wf_file" ]; then
+    echo "X ci-local: no workflow named '$WORKFLOW' under .github/workflows/" >&2
+    exit 2
+  fi
+  TRIGGER=$(awk '
+    /^[[:space:]]*uses:[[:space:]]*\.\/\.github\/workflows\/ci-dispatch\.ya?ml[[:space:]]*$/ { inside = 1; next }
+    inside && /^[[:space:]]+trigger:/ { sub(/^[[:space:]]+trigger:[[:space:]]*/, ""); gsub(/["\047[:space:]]/, ""); print; exit }
+  ' "$wf_file")
+  if [ -z "$TRIGGER" ]; then
+    echo "X ci-local: $WORKFLOW does not call ci-dispatch.yml with a trigger; run it with --trigger <t>" >&2
+    exit 2
+  fi
+  echo "=> ci-local: workflow $WORKFLOW runs trigger=$TRIGGER"
+fi
+
+case "$TRIGGER" in
+  push|pr-open|pr-merge-dev|pr-merge-main|tag) ;;
+  *) echo "X ci-local: unknown trigger '$TRIGGER' (want push, pr-open, pr-merge-dev, pr-merge-main, tag)" >&2; exit 2 ;;
+esac
+
+case "$KIND" in
+  tests|audits|both) ;;
+  *) echo "X ci-local: --kind must be tests or audits (got '$KIND')" >&2; exit 2 ;;
+esac
+
+cd "$REPO_ROOT"
+
+# The tag trigger builds a named tag; on GitHub the tag ref names it, off
+# grid HEAD must sit on it.
+if [ "$TRIGGER" = "tag" ] && [ -z "${TAG:-}" ] && ! $LIST; then
+  TAG=$(git describe --exact-match --tags --match 'v*' HEAD 2>/dev/null || true)
+  if [ -z "$TAG" ]; then
+    echo "X ci-local: trigger=tag needs TAG=<v* tag> or a checkout of a v* tag" >&2
+    exit 2
+  fi
+  export TAG
+  echo "=> ci-local: building tag $TAG"
+fi
+
+# Enumerate via the dispatcher's --list mode; never re-implement the
+# discovery walk. Each line is TAB-separated:
+#   layer<TAB>kind<TAB>script_path<TAB>check_name<TAB>required<TAB>basename
+LINES=()
+while IFS= read -r line; do
+  [ -n "$line" ] && LINES+=("$line")
+done < <(bash "$DISPATCH" --trigger "$TRIGGER" --kind "$KIND" --list)
+
+# Apply the --only filter on the check name (basename minus .sh).
+if [ -n "$ONLY" ]; then
+  FILTERED=()
+  for line in ${LINES[@]+"${LINES[@]}"}; do
+    name=$(printf '%s' "$line" | cut -f4)
+    [ "$name" = "$ONLY" ] && FILTERED+=("$line")
+  done
+  if [ ${#FILTERED[@]} -eq 0 ]; then
+    echo "X ci-local: no check named '$ONLY' matched trigger=$TRIGGER kind=$KIND" >&2
+    echo "  (run 'ci-local --trigger $TRIGGER --list' to see the available names)" >&2
+    exit 2
+  fi
+  LINES=(${FILTERED[@]+"${FILTERED[@]}"})
+  if ! $ALLOW_CLAIM && ! $LIST; then
+    case "$ONLY" in
+      claim|required.claim)
+        echo "X ci-local: '$ONLY' is a live claim (amends, tags and force-pushes); pass --allow-claim to run it" >&2
+        exit 2 ;;
+    esac
+  fi
+fi
+
+# is_claim_check <name>: 0 for a merge claim (sys required.claim or a
+# consumer claim.sh), the only checks with side effects beyond the run.
+is_claim_check() { case "$1" in claim|required.claim) return 0 ;; esac; return 1; }
+
+if [ ${#LINES[@]} -eq 0 ]; then
+  echo "=> ci-local: no scripts matched trigger=$TRIGGER kind=$KIND; nothing to run"
+  exit 0
+fi
+
+if $LIST; then
+  printf '%-5s %-7s %-35s %-9s %s\n' "LAYER" "KIND" "CHECK" "REQUIRED" "SCRIPT"
+  for line in ${LINES[@]+"${LINES[@]}"}; do
+    IFS=$'\t' read -r layer kind script name req bn <<<"$line"
+    printf '%-5s %-7s %-35s %-9s %s\n' "$layer" "$kind" "$name" "$req" "$script"
+  done
+  exit 0
+fi
+
+# Run mode: invoke each selected script from the repo root with the
+# same per-check env the workflow's check job exports. Exit codes are
+# captured per script; required failures drive the final exit code.
+RESULTS=()
+required_failed=0
+
+for line in ${LINES[@]+"${LINES[@]}"}; do
+  IFS=$'\t' read -r layer kind script name req bn <<<"$line"
+  echo
+  if is_claim_check "$name" && ! $ALLOW_CLAIM; then
+    echo "=== SKIP $name ($layer/$kind/$bn): a live claim (amends, tags, force-pushes); pass --allow-claim to run it ==="
+    RESULTS+=("$name"$'\t'"$layer"$'\t'"$kind"$'\t'"$req"$'\t'"SKIP")
+    continue
+  fi
+  echo "=== ci-local [$TRIGGER] $layer/$kind/$bn (required=$req) ==="
+  rc=0
+  CI_TRIGGER="$TRIGGER" \
+  CI_LAYER="$layer" \
+  CI_KIND="$kind" \
+  CI_CHECK_NAME="$name" \
+  CI_REQUIRED="$req" \
+  bash "$script" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    result="PASS"
+    echo "=== PASS $name ==="
+  else
+    result="FAIL"
+    echo "=== FAIL $name (rc=$rc) ==="
+    [ "$req" = "true" ] && required_failed=1
+  fi
+  RESULTS+=("$name"$'\t'"$layer"$'\t'"$kind"$'\t'"$req"$'\t'"$result")
+done
+
+echo
+echo "=========================================================="
+printf '%-35s %-5s %-7s %-9s %s\n' "CHECK" "LAYER" "KIND" "REQUIRED" "RESULT"
+for row in ${RESULTS[@]+"${RESULTS[@]}"}; do
+  IFS=$'\t' read -r name layer kind req result <<<"$row"
+  printf '%-35s %-5s %-7s %-9s %s\n' "$name" "$layer" "$kind" "$req" "$result"
+done
+
+# Archive the verdict chain onto refs/v4rian/ci-log: one commit per run,
+# parented on the prior run, carrying a single summary file. The custom ref
+# namespace is the whole point - pushes outside refs/heads and refs/tags
+# never fire workflows, so an off-grid or CI-off repo with a reachable
+# origin gets durable log archival with zero CI side effects. An
+# unreachable origin degrades to a local-only archive with a WARN.
+archive_run() {
+  local verdict="$1" ts sha summary_file blob tree parent commit
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  sha=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
+  summary_file=$(mktemp -t ci-local-archive.XXXXXX)
+  {
+    printf 'ci-local run %s
+trigger=%s kind=%s only=%s
+head=%s verdict=%s
+
+'       "$ts" "$TRIGGER" "$KIND" "${ONLY:-all}" "$sha" "$verdict"
+    printf '%-35s %-5s %-7s %-9s %s
+' "CHECK" "LAYER" "KIND" "REQUIRED" "RESULT"
+    local row
+    for row in ${RESULTS[@]+"${RESULTS[@]}"}; do
+      IFS=$'	' read -r name layer kind req result <<<"$row"
+      printf '%-35s %-5s %-7s %-9s %s
+' "$name" "$layer" "$kind" "$req" "$result"
+    done
+  } > "$summary_file"
+  blob=$(git hash-object -w "$summary_file")
+  rm -f "$summary_file"
+  tree=$(printf '100644 blob %s	ci-local-%s-%s.txt
+' "$blob" "$ts" "$sha" | git mktree)
+  parent=$(git rev-parse --verify --quiet refs/v4rian/ci-log || true)
+  # shellcheck disable=SC2086
+  commit=$(git commit-tree "$tree" ${parent:+-p $parent} -m "ci-local [$TRIGGER] $verdict at $sha ($ts)")
+  git update-ref refs/v4rian/ci-log "$commit"
+  echo "-> archive: run recorded on refs/v4rian/ci-log ($commit)"
+  if git remote get-url origin >/dev/null 2>&1; then
+    if git push --quiet origin refs/v4rian/ci-log:refs/v4rian/ci-log 2>/dev/null; then
+      echo "-> archive: refs/v4rian/ci-log pushed to origin (no workflows fire on custom refs)"
+    else
+      echo "  ! archive WARN: origin unreachable or push rejected; archive kept local on refs/v4rian/ci-log" >&2
+    fi
+  else
+    echo "  ! archive WARN: no origin bound; archive kept local on refs/v4rian/ci-log" >&2
+  fi
+}
+
+if [ "$required_failed" -ne 0 ]; then
+  echo
+  $ARCHIVE && archive_run FAIL
+  echo "X ci-local [$TRIGGER]: at least one required check failed"
+  exit 1
+fi
+echo
+$ARCHIVE && archive_run PASS
+echo "ok: ci-local [$TRIGGER]: all required checks passed (advisory failures, if any, are listed above)"
+exit 0

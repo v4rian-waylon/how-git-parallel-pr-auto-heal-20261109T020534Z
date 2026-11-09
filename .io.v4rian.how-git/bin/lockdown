@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# lockdown - one-shot v4rian governance lockdown for a how-git repo.
+#
+# Pins pool/* creation to the allocator workflow's identity, locks down
+# safety/* against any mutation, locks vault/* read-only forever, and
+# layers the dev required-status-checks ruleset on top of branch
+# protection. Standalone: runs against any v4rian repo without needing
+# the template files locally. Reads ruleset JSON from
+# .io.v4rian.how-git/rulesets/ when invoked from inside a clone, falls
+# back to inline JSON when invoked from a shuttle drop.
+#
+# Repository Rulesets require GitHub Pro on private repos OR the repo
+# must be public. The script probes for that BEFORE attempting any
+# mutation and exits with a clear actionable message if the repo is
+# not eligible. No more silently-masked 403s. Branch protection (the
+# legacy layer) works on all tiers and is applied separately by
+# scripts/apply-repo-rules.sh or bin/bootstrap-ci.
+#
+# Usage:
+#   lockdown --repo OWNER/REPO [--dry-run] [--verify-only]
+#   lockdown -h | --help
+#
+# Inputs:
+#   --repo OWNER/REPO         target repo (required)
+#   --dry-run                 print what would land; no mutations
+#   --verify-only             only check current state; no mutations
+#   -h, --help                this help
+#
+# Token resolution order:
+#   1. $GH_TOKEN
+#   2. gh auth token (if gh installed + logged in)
+#   3. ~/.gcm/store/git/https/github.com/<account>.credential (line 1)
+#
+# Exit codes:
+#   0  every ruleset present and active after the run
+#   2  bad input / missing token / non-admin actor
+#   3  repo not eligible for rulesets (private + free tier; needs Pro
+#      or public visibility)
+#   4  one or more ruleset apply calls failed (other than 403)
+#   5  post-apply verification found a missing or misconfigured ruleset
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Flag parsing
+# ---------------------------------------------------------------------------
+REPO=""
+DRY_RUN=false
+VERIFY_ONLY=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)              REPO="$2"; shift 2 ;;
+    --allocator-app-id)  # legacy no-op: bypass actors live in the ruleset
+                         # JSON itself (admins only)
+                         echo ". --allocator-app-id is obsolete; ignoring" >&2
+                         shift 2 ;;
+    --dry-run)           DRY_RUN=true; shift ;;
+    --verify-only)       VERIFY_ONLY=true; shift ;;
+    -h|--help)           sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$REPO" ]; then
+  echo "X --repo OWNER/REPO is required" >&2
+  exit 2
+fi
+# ---------------------------------------------------------------------------
+# Token resolution
+# ---------------------------------------------------------------------------
+TOKEN="${GH_TOKEN:-}"
+if [ -z "$TOKEN" ] && command -v gh >/dev/null 2>&1; then
+  TOKEN=$(gh auth token 2>/dev/null || true)
+fi
+if [ -z "$TOKEN" ] && [ -d "$HOME/.gcm/store/git/https/github.com" ]; then
+  for f in "$HOME"/.gcm/store/git/https/github.com/*.credential; do
+    [ -f "$f" ] && TOKEN=$(head -1 "$f" 2>/dev/null || true) && break
+  done
+fi
+if [ -z "$TOKEN" ]; then
+  echo "X no GitHub token available. Resolve one of:" >&2
+  echo "  export GH_TOKEN=<token>" >&2
+  echo "  gh auth login" >&2
+  echo "  populate ~/.gcm/store/git/https/github.com/<account>.credential" >&2
+  exit 2
+fi
+
+API="https://api.github.com"
+H_AUTH="Authorization: token $TOKEN"
+H_ACCEPT="Accept: application/vnd.github+json"
+
+# ---------------------------------------------------------------------------
+# Pre-flight: actor identity + admin role + Pro/public eligibility
+# ---------------------------------------------------------------------------
+echo "-> lockdown on $REPO$([ "$DRY_RUN" = true ] && printf ' (dry-run)')$([ "$VERIFY_ONLY" = true ] && printf ' (verify-only)')"
+
+ACTOR=$(curl -sS -H "$H_AUTH" "$API/user" | python3 -c "import json,sys; print(json.load(sys.stdin).get('login',''))" 2>/dev/null || true)
+if [ -z "$ACTOR" ]; then
+  echo "X token does not authenticate to /user; check that it is valid + has read:user scope" >&2
+  exit 2
+fi
+echo "   actor: $ACTOR"
+
+PERM=$(curl -sS -H "$H_AUTH" "$API/repos/$REPO/collaborators/$ACTOR/permission" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin).get('permission','unknown'))" 2>/dev/null || echo unknown)
+echo "   permission: $PERM"
+if [ "$PERM" != "admin" ] && ! $VERIFY_ONLY; then
+  echo "X actor '$ACTOR' has permission '$PERM' on $REPO; admin required to apply rulesets" >&2
+  exit 2
+fi
+
+# Per-process work dir (honours TMPDIR) for API bodies and rendered
+# rulesets, so concurrent runs never share a file.
+WORK_DIR=$(mktemp -d -t v4rian-lockdown-XXXXXX)
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Probe rulesets endpoint to detect the Pro-or-public eligibility gate.
+# A 403 with the upgrade message is the inert signal we want to surface;
+# any other HTTP status means we proceed.
+PROBE=$(curl -sS -o "$WORK_DIR/probe" -w "%{http_code}" \
+  -H "$H_AUTH" -H "$H_ACCEPT" "$API/repos/$REPO/rulesets")
+PROBE_BODY=$(cat "$WORK_DIR/probe" 2>/dev/null || true)
+rm -f "$WORK_DIR/probe"
+if [ "$PROBE" = "403" ] && printf '%s' "$PROBE_BODY" | grep -q "GitHub Pro"; then
+  echo "X repo not eligible for Repository Rulesets" >&2
+  echo "  $REPO is private on the free tier; Repository Rulesets need GitHub Pro OR the repo to be public." >&2
+  echo "  Two ways out:" >&2
+  echo "    1. Upgrade the owner to GitHub Pro (\$4/mo); then re-run this script." >&2
+  echo "    2. Make the repo public; then re-run this script." >&2
+  echo "  Branch protection (the legacy layer that gates main/dev PRs and required status checks)" >&2
+  echo "  works on the free tier and is applied separately by bin/bootstrap-ci or scripts/apply-repo-rules.sh." >&2
+  exit 3
+fi
+if [ "$PROBE" != "200" ]; then
+  echo "X rulesets endpoint returned HTTP $PROBE" >&2
+  echo "$PROBE_BODY" >&2
+  exit 4
+fi
+echo "   rulesets endpoint OK (eligible)"
+
+# ---------------------------------------------------------------------------
+# Ruleset JSON: read from clone if available, else inline
+# ---------------------------------------------------------------------------
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+RULESETS_DIR="$SCRIPT_DIR/../rulesets"
+if [ ! -d "$RULESETS_DIR" ]; then
+  # Standalone (shuttle) run: assemble inline.
+  RULESETS_DIR="$WORK_DIR/rulesets"
+  mkdir -p "$RULESETS_DIR"
+  cat > "$RULESETS_DIR/pool-creations.json" <<'JSON'
+{"name":"v4rian-pool-creations","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/pool/*","refs/heads/pool/*/*"],"exclude":["refs/heads/pool/*.reconcile.*","refs/heads/pool/*/*.reconcile.*"]}},"rules":[{"type":"creation"}],"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]}
+JSON
+  cat > "$RULESETS_DIR/pool-deletions.json" <<'JSON'
+{"name":"v4rian-pool-deletions","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/pool/*","refs/heads/pool/*/*"],"exclude":[]}},"rules":[{"type":"deletion"}],"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]}
+JSON
+  cat > "$RULESETS_DIR/safety-lockdown.json" <<'JSON'
+{"name":"v4rian-safety-lockdown","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/safety/*","refs/heads/safety/*/*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"}],"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]}
+JSON
+  cat > "$RULESETS_DIR/vault-readonly.json" <<'JSON'
+{"name":"v4rian-vault-readonly","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/vault/*","refs/heads/vault/*/*"],"exclude":[]}},"rules":[{"type":"update"},{"type":"deletion"}],"bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}]}
+JSON
+  cat > "$RULESETS_DIR/dev-required-checks.json" <<'JSON'
+{"name":"v4rian-dev-required-checks","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/dev"],"exclude":[]}},"rules":[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"required_status_checks":[{"context":"required.commit-audit"},{"context":"required.compile"},{"context":"required.coverage"},{"context":"required.runtime"},{"context":"required.offline-test-suites"},{"context":"reconcile"}]}}],"bypass_actors":[]}
+JSON
+fi
+
+# Truth-from-state CI bot App probe: when installed, its Integration
+# bypass rides every lockdown ruleset below (same contract as
+# apply-repo-rules.sh).
+CI_BOT_APP_ID_EFFECTIVE=$(curl -sS -H "$H_AUTH" -H "$H_ACCEPT" "$API/repos/$REPO/installation" 2>/dev/null \
+  | python3 -c "import json,sys
+try:
+    v=json.load(sys.stdin).get('app_id')
+    print(v if isinstance(v,int) else '')
+except Exception:
+    print('')" 2>/dev/null)
+printf '%s' "$CI_BOT_APP_ID_EFFECTIVE" | grep -qE '^[0-9]+$' || CI_BOT_APP_ID_EFFECTIVE=""
+
+WANTED=(v4rian-pool-creations v4rian-pool-deletions v4rian-safety-lockdown v4rian-vault-readonly v4rian-dev-required-checks)
+FILES=("$RULESETS_DIR/pool-creations.json" "$RULESETS_DIR/pool-deletions.json" "$RULESETS_DIR/safety-lockdown.json" "$RULESETS_DIR/vault-readonly.json" "$RULESETS_DIR/dev-required-checks.json")
+
+# ---------------------------------------------------------------------------
+# List existing rulesets so we can update-in-place instead of duplicating
+# ---------------------------------------------------------------------------
+EXISTING=$(curl -sS -H "$H_AUTH" -H "$H_ACCEPT" "$API/repos/$REPO/rulesets?per_page=100")
+existing_id_for() {
+  printf '%s' "$EXISTING" | NAME="$1" python3 -c "
+import json,sys,os
+name=os.environ['NAME']
+try:
+    for r in json.load(sys.stdin):
+        if r.get('name')==name:
+            print(r.get('id',''))
+            sys.exit(0)
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+inject_bypass() {
+  # Same contract as apply-repo-rules.sh: the template's declared bypass
+  # actors (the RepositoryRole admin escape hatch) pass through
+  # verbatim; OrganizationAdmin is appended
+  # where missing; the _comment field the API rejects is dropped. No
+  # Integration actor is ever injected - GitHub rejects it from any
+  # non-workflow ruleset source.
+  local src="$1" dst="$2"
+  python3 -c "
+import json,sys
+src,dst,app_id=sys.argv[1],sys.argv[2],sys.argv[3]
+with open(src) as f: obj=json.load(f)
+obj.pop('_comment',None)
+existing=obj.get('bypass_actors')
+if existing is None:
+    obj['bypass_actors']=[
+        {'actor_id':1,'actor_type':'OrganizationAdmin','bypass_mode':'always'},
+    ]
+else:
+    if not any(b.get('actor_type')=='OrganizationAdmin' for b in existing):
+        existing.append({'actor_id':1,'actor_type':'OrganizationAdmin','bypass_mode':'always'})
+    if app_id.isdigit() and not any(b.get('actor_type')=='Integration' for b in existing):
+        existing.append({'actor_id':int(app_id),'actor_type':'Integration','bypass_mode':'always'})
+with open(dst,'w') as f: json.dump(obj,f,indent=2)
+" "$src" "$dst" "${CI_BOT_APP_ID_EFFECTIVE:-}"
+}
+
+apply_ruleset() {
+  local name="$1" file="$2"
+  local rendered="$WORK_DIR/$name.json" resp="$WORK_DIR/resp"
+  inject_bypass "$file" "$rendered"
+  id=$(existing_id_for "$name")
+  if $DRY_RUN || $VERIFY_ONLY; then
+    if [ -n "$id" ]; then
+      echo "  [$([ "$DRY_RUN" = true ] && printf dry-run)$([ "$VERIFY_ONLY" = true ] && printf verify)] $name present (id=$id); would PUT update"
+    else
+      echo "  [$([ "$DRY_RUN" = true ] && printf dry-run)$([ "$VERIFY_ONLY" = true ] && printf verify)] $name absent; would POST create"
+    fi
+    rm -f "$rendered"
+    return 0
+  fi
+  local rc body
+  if [ -n "$id" ]; then
+    body=$(curl -sS -o "$resp" -w "%{http_code}" -X PUT \
+      -H "$H_AUTH" -H "$H_ACCEPT" \
+      --data-binary "@$rendered" \
+      "$API/repos/$REPO/rulesets/$id")
+    rc="$body"
+  else
+    body=$(curl -sS -o "$resp" -w "%{http_code}" -X POST \
+      -H "$H_AUTH" -H "$H_ACCEPT" \
+      --data-binary "@$rendered" \
+      "$API/repos/$REPO/rulesets")
+    rc="$body"
+  fi
+  case "$rc" in
+    200|201)
+      echo "  ok $name (HTTP $rc; $( [ -n "$id" ] && echo updated || echo created ))"
+      ;;
+    *)
+      echo "  X $name failed: HTTP $rc" >&2
+      cat "$resp" >&2
+      echo "" >&2
+      rm -f "$rendered" "$resp"
+      return 1
+      ;;
+  esac
+  rm -f "$rendered" "$resp"
+}
+
+# ---------------------------------------------------------------------------
+# Apply
+# ---------------------------------------------------------------------------
+FAIL=0
+for i in "${!WANTED[@]}"; do
+  name="${WANTED[$i]}"
+  file="${FILES[$i]}"
+  if ! apply_ruleset "$name" "$file"; then
+    FAIL=$((FAIL + 1))
+  fi
+done
+[ "$FAIL" -gt 0 ] && exit 4
+
+# ---------------------------------------------------------------------------
+# Post-apply verification
+# ---------------------------------------------------------------------------
+if $DRY_RUN; then
+  echo "-> dry-run complete"
+  exit 0
+fi
+echo "-> verifying"
+EXISTING=$(curl -sS -H "$H_AUTH" -H "$H_ACCEPT" "$API/repos/$REPO/rulesets?per_page=100")
+MISS=0
+for name in ${WANTED[@]+"${WANTED[@]}"}; do
+  state=$(printf '%s' "$EXISTING" | NAME="$name" python3 -c "
+import json,sys,os
+name=os.environ['NAME']
+try:
+    for r in json.load(sys.stdin):
+        if r.get('name')==name:
+            print(r.get('enforcement','?'))
+            sys.exit(0)
+    print('absent')
+except Exception:
+    print('error')
+" 2>/dev/null)
+  case "$state" in
+    active) echo "   ok $name enforcement=active" ;;
+    *)
+      echo "   X $name state=$state (expected active)" >&2
+      MISS=$((MISS + 1))
+      ;;
+  esac
+done
+
+# Enforcement=active alone does not prove the dev gate is correct: a stale
+# ruleset can be active yet missing a required context (e.g. reconcile).
+# Deep-verify the dev-required-checks contexts against the source file.
+DRC_NAME="v4rian-dev-required-checks"
+DRC_ID=$(printf '%s' "$EXISTING" | NAME="$DRC_NAME" python3 -c "
+import json,sys,os
+name=os.environ['NAME']
+try:
+    for r in json.load(sys.stdin):
+        if r.get('name')==name:
+            print(r.get('id','')); break
+except Exception:
+    pass
+" 2>/dev/null)
+if [ -n "$DRC_ID" ]; then
+  LIVE_CTX=$(curl -sS -H "$H_AUTH" -H "$H_ACCEPT" "$API/repos/$REPO/rulesets/$DRC_ID" \
+    | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(' '.join(sorted(c['context'] for r in d.get('rules',[]) if r.get('type')=='required_status_checks' for c in r['parameters']['required_status_checks'])))
+except Exception:
+    print('')
+" 2>/dev/null)
+  WANT_CTX=$(python3 -c "
+import json,sys
+try:
+    d=json.load(open('$RULESETS_DIR/dev-required-checks.json'))
+    print(' '.join(sorted(c['context'] for r in d.get('rules',[]) if r.get('type')=='required_status_checks' for c in r['parameters']['required_status_checks'])))
+except Exception:
+    print('')
+" 2>/dev/null)
+  if [ -z "$LIVE_CTX" ] || [ "$LIVE_CTX" != "$WANT_CTX" ]; then
+    echo "   X $DRC_NAME required-check contexts drift: live=[$LIVE_CTX] expected=[$WANT_CTX]" >&2
+    MISS=$((MISS + 1))
+  else
+    echo "   ok $DRC_NAME contexts=[$LIVE_CTX]"
+  fi
+fi
+if [ "$MISS" -gt 0 ]; then
+  echo "X $MISS ruleset(s) failed verification" >&2
+  exit 5
+fi
+
+echo "-> lockdown complete: ${#WANTED[@]} v4rian-* rulesets active on $REPO"

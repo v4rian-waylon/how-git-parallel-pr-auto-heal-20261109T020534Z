@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# doctor - one-shot health check of the v4rian repo setup.
+#
+# Default mode (fast, seconds): structural checks.
+#   - core.hooksPath set correctly, fallback post-merge installed
+#   - every shipped bin exists + executable
+#   - every shipped script exists + executable
+#   - every shipped hook exists + executable
+#   - every CI workflow file present
+#   - no stray VERSION file at repo root
+#   - no stray SERIES file at repo root (SERIES is auto-derived from main merges; the file is obsolete)
+#   - git remote origin configured
+#   - python3 + gh CLI available (for full functionality)
+#
+# Deep mode (slow, ~1m+): behavioral diagnostics.
+#   - Runs .io.v4rian.how-git/framework-tests/test-lifecycle.sh + test-hooks.sh against this
+#     install. These ARE the framework's own tests that pool/n45 set up
+#     to skip on consumer CI; here they serve as on-demand diagnostics
+#     so an operator can verify the framework is functionally intact
+#     (claim flow, hooks, audits, rulesets, mode-flip, vault scheme, etc.)
+#     without waiting for the framework's own CI to be the proof. Run
+#     it when something feels wrong or after upgrading the framework.
+#
+# Consumer mode (fast, seconds): read-only readiness diagnostics for a
+#   CONSUMER install (a repo carrying a vendored framework copy).
+#   - vendored dir present + core.hooksPath set
+#   - MODE content valid (connected or off-grid)
+#   - SPEC provenance stamped (absent is a warning, not a failure)
+#   - build.sh / distribute-internal.sh override obligations honored
+#   - ci/ scripts executable, ci-dispatch.yml wired
+#   Not applicable to the framework source repo (FRAMEWORK_REPO marker
+#   present): prints a notice and exits 2.
+#
+# Exits 0 if healthy, non-zero with a list of issues otherwise.
+#
+# Usage:
+#   doctor                      human-readable structural report (default)
+#   doctor --quiet              structural mode, exit code only
+#   doctor --deep               structural + behavioral diagnostics
+#   doctor --deep --quiet       exit code only
+#   doctor --consumer           consumer install readiness report
+#   doctor --consumer --quiet   exit code only
+#   doctor -h | --help
+
+set -uo pipefail
+
+usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+case "${1:-}" in -h|--help) usage ;; esac
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X doctor: not inside a git repo" >&2
+  exit 2
+fi
+
+QUIET=false
+DEEP=false
+CONSUMER=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quiet) QUIET=true; shift ;;
+    --deep)  DEEP=true; shift ;;
+    --consumer) CONSUMER=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+cd "$REPO_ROOT"
+
+ISSUES=()
+
+check_exec() {
+  local f="$1"
+  if [ ! -e "$f" ]; then
+    ISSUES+=("missing: $f")
+  elif [ ! -x "$f" ]; then
+    ISSUES+=("not executable: $f")
+  fi
+}
+
+check_file() {
+  local f="$1"
+  [ ! -e "$f" ] && ISSUES+=("missing: $f")
+}
+
+# core.hooksPath drift probe, shared by the default structural pass and
+# consumer mode. Prints the issue text on drift, prints nothing when correct.
+hooks_path_issue() {
+  local hooks_path
+  hooks_path=$(git config core.hooksPath 2>/dev/null || true)
+  if [ "$hooks_path" != ".io.v4rian.how-git/githooks" ]; then
+    printf "core.hooksPath = '%s' (expected .io.v4rian.how-git/githooks); run heal.sh" "${hooks_path:-unset}"
+  fi
+}
+
+# Consumer mode: read-only readiness diagnostics for a consumer install.
+# Reuses hooks_path_issue for the structural probe and _lib.sh's get_mode +
+# get_spec_field accessors for MODE and SPEC provenance. Exits 2 on the
+# framework source repo, 1 when any check fails, 0 otherwise.
+consumer_checks() {
+  local fails=0 warns=0
+
+  c_ok()   { $QUIET || echo "  ok: $*"; }
+  c_warn() { warns=$((warns + 1)); $QUIET || echo "  warn: $*"; }
+  c_fail() { fails=$((fails + 1)); $QUIET || echo "  X $*"; }
+
+  # Framework source repo: consumer checks do not apply.
+  if [ -f .io.v4rian.how-git/FRAMEWORK_REPO ]; then
+    echo "X doctor --consumer: consumer checks do not apply to the framework source repo (FRAMEWORK_REPO marker present)" >&2
+    exit 2
+  fi
+
+  # Vendored framework dir + shared helper library.
+  if [ ! -d .io.v4rian.how-git ]; then
+    $QUIET || echo "  X vendored framework dir .io.v4rian.how-git/ missing (nothing to diagnose)"
+    exit 1
+  fi
+  if [ ! -f .io.v4rian.how-git/scripts/_lib.sh ]; then
+    echo "X doctor --consumer: .io.v4rian.how-git/scripts/_lib.sh missing (vendored install incomplete)" >&2
+    exit 2
+  fi
+  # shellcheck source=../scripts/_lib.sh
+  . .io.v4rian.how-git/scripts/_lib.sh
+  c_ok "vendored framework dir .io.v4rian.how-git/ present"
+
+  # core.hooksPath (same probe as the default structural pass)
+  local hp_issue
+  hp_issue=$(hooks_path_issue)
+  if [ -n "$hp_issue" ]; then
+    c_fail "$hp_issue"
+  else
+    c_ok "core.hooksPath = .io.v4rian.how-git/githooks"
+  fi
+
+  # MODE content
+  local mode
+  mode=$(get_mode 2>/dev/null || echo connected)
+  case "$mode" in
+    connected|off-grid) c_ok "mode: $mode" ;;
+    *) c_fail ".io.v4rian.how-git/MODE has invalid value '$mode' (expected: connected or off-grid)" ;;
+  esac
+
+  # SPEC provenance (stamped by the vendoring tools; template-generated
+  # consumers lack it until a vendoring tool stamps it, so absence is a
+  # warning rather than a failure)
+  local spec_source
+  spec_source=$(get_spec_field source 2>/dev/null || true)
+  # Only the credential-free form is ever printed (terminal and CI logs).
+  local spec_source_shown
+  spec_source_shown=$(hg_strip_url_credentials "$spec_source")
+  if [ ! -f .io.v4rian.how-git/SPEC ]; then
+    c_warn "SPEC provenance file absent (expected until a vendoring tool stamps it)"
+  elif [ -n "$spec_source" ]; then
+    c_ok "SPEC provenance: source=$spec_source_shown"
+  else
+    c_warn "SPEC provenance file present but source= is empty (restamp via the vendoring tool)"
+  fi
+
+  # SPEC ref must exist at the SPEC source, or sync-framework cannot find
+  # its base; a SPEC tag must resolve there to the same commit. Asked of the
+  # source itself (hg_source_has_commit / hg_source_tag_sha); an
+  # unreachable source is a warning, never a pass.
+  local spec_ref spec_tag tag_sha has_rc
+  spec_ref=$(get_spec_field ref 2>/dev/null || true)
+  spec_tag=$(get_spec_field tag 2>/dev/null || true)
+  if [ -n "$spec_source" ]; then
+    if hg_has_credentials "$spec_source"; then
+      c_fail "SPEC source= carries a credential; restamp it with the bare URL (sync-framework restamps through stamp_spec)"
+    fi
+    if [ -z "$spec_ref" ] || [ "$spec_ref" = "unknown" ]; then
+      c_warn "SPEC ref= is unknown (sync-framework will fall back to content matching)"
+    else
+      hg_source_has_commit "$spec_source" "$spec_ref"; has_rc=$?
+      case "$has_rc" in
+        0)
+          tag_sha=""
+          if [ -n "$spec_tag" ] && [ "$spec_tag" != "none" ]; then
+            tag_sha=$(hg_source_tag_sha "$spec_source" "$spec_tag")
+          fi
+          if [ -n "$tag_sha" ] && [ "$tag_sha" != "$spec_ref" ]; then
+            c_fail "SPEC ref $spec_ref exists at the source but tag $spec_tag resolves to $tag_sha there (restamp the SPEC)"
+          else
+            c_ok "SPEC ref $spec_ref exists at the source${tag_sha:+ (tag $spec_tag resolves to it)}"
+          fi
+          ;;
+        1)
+          c_fail "SPEC ref $spec_ref does not exist at the source $spec_source_shown (stale stamp; sync-framework recovers through tag=$spec_tag when its tree matches, else pass --base-ref)"
+          ;;
+        *)
+          c_warn "SPEC ref $spec_ref unverified: the source $spec_source_shown is unreachable from here"
+          ;;
+      esac
+    fi
+  fi
+
+  # build.sh override obligation for CMake projects (the template ships no
+  # generic Qt/C++ recipe; a consumer with a CMakeLists.txt must override)
+  local build_sh=".io.v4rian.how-git/scripts/build.sh"
+  if [ -f CMakeLists.txt ] && [ -f "$build_sh" ] \
+     && grep -q "OVERRIDE build.sh with your project's build steps" "$build_sh"; then
+    c_fail "CMakeLists.txt project but scripts/build.sh is still the template placeholder; override it with the project's real build commands"
+  else
+    c_ok "build.sh override obligation satisfied or not applicable"
+  fi
+
+  # release-test.sh override obligation mirrors build.sh's: a CMake project
+  # has no generic run recipe, so the placeholder banner must be replaced
+  # with the project's real launch/smoke assertions.
+  local release_test=".io.v4rian.how-git/scripts/release-test.sh"
+  if [ -f CMakeLists.txt ] && [ -f "$release_test" ] \
+     && grep -q "OVERRIDE release-test.sh with your project's run tests" "$release_test"; then
+    c_fail "CMakeLists.txt project but scripts/release-test.sh is still the template placeholder; override it with the project's real run tests"
+  else
+    c_ok "release-test.sh override obligation satisfied or not applicable"
+  fi
+
+  # distribute-internal.sh placeholder
+  local dist_internal=".io.v4rian.how-git/scripts/distribute-internal.sh"
+  if [ -f "$dist_internal" ] && grep -q "PLACEHOLDER_DISTRIBUTE_INTERNAL_NOT_YET_FILLED" "$dist_internal"; then
+    c_warn "distribute-internal.sh is still the template placeholder (internal distribution channel not wired)"
+  else
+    c_ok "distribute-internal.sh overridden or absent"
+  fi
+
+  # ci/**/*.sh executability (the sys-layer recipes ci-dispatch.yml runs)
+  local ci_offenders="" ci_count=0 f
+  if [ -d ci ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      ci_count=$((ci_count + 1))
+      [ -x "$f" ] || ci_offenders="$ci_offenders $f"
+    done < <(find ci -type f -name '*.sh' 2>/dev/null | sort)
+  fi
+  if [ "$ci_count" -eq 0 ]; then
+    c_ok "no ci/**/*.sh scripts present"
+  elif [ -n "$ci_offenders" ]; then
+    c_fail "ci scripts not executable:$ci_offenders"
+  else
+    c_ok "all $ci_count ci/**/*.sh scripts executable"
+  fi
+
+  # ci-dispatch workflow
+  if [ -f .github/workflows/ci-dispatch.yml ]; then
+    c_ok ".github/workflows/ci-dispatch.yml present"
+  else
+    c_warn ".github/workflows/ci-dispatch.yml absent (push, PR, and tag recipes will not fire)"
+  fi
+
+  # Summary
+  if ! $QUIET; then
+    echo ""
+    if [ "$fails" -gt 0 ]; then
+      echo "X consumer readiness check failed ($fails failure(s), $warns warning(s))"
+    elif [ "$warns" -gt 0 ]; then
+      echo "ok: consumer readiness check passed ($warns warning(s))"
+    else
+      echo "ok: consumer readiness check passed"
+    fi
+  fi
+  [ "$fails" -gt 0 ] && exit 1
+  exit 0
+}
+
+if $CONSUMER; then
+  consumer_checks
+fi
+
+# core.hooksPath
+HP_ISSUE=$(hooks_path_issue)
+if [ -n "$HP_ISSUE" ]; then
+  ISSUES+=("$HP_ISSUE")
+fi
+
+# Hooks-off fallback post-merge (read-only probe from _lib.sh)
+if [ -f .io.v4rian.how-git/scripts/_lib.sh ]; then
+  # shellcheck source=../scripts/_lib.sh
+  . .io.v4rian.how-git/scripts/_lib.sh
+  FB_ISSUE=$(merge_hook_fallback_issue)
+  [ -z "$FB_ISSUE" ] || ISSUES+=("$FB_ISSUE")
+fi
+
+# Bins
+for b in version status ship release-of doctor queue changelog preview-merge; do
+  check_exec ".io.v4rian.how-git/bin/$b"
+done
+
+# Scripts (REQUIRED)
+for s in claim-dev-merge.sh claim-main-release.sh auto-rebase-pools-after-dev-merge.sh \
+         open-pr.sh apply-repo-rules.sh \
+         heal.sh verify-template.sh; do
+  check_exec ".io.v4rian.how-git/scripts/$s"
+done
+
+# Scripts (OPTIONAL - present in some template revisions, absent in others)
+for s in archive-pool-branch.sh build.sh release-test.sh distribute-internal.sh distribute-public.sh; do
+  # Don't ISSUE on missing; only flag if present-but-not-executable
+  if [ -e ".io.v4rian.how-git/scripts/$s" ] && [ ! -x ".io.v4rian.how-git/scripts/$s" ]; then
+    ISSUES+=("not executable: .io.v4rian.how-git/scripts/$s")
+  fi
+done
+
+# Hooks
+for h in pre-push post-checkout commit-msg post-merge; do
+  check_exec ".io.v4rian.how-git/githooks/$h"
+done
+
+# Workflows REQUIRED for core lifecycle
+#
+# Pool/n55 migrated the per-trigger workflow yamls (audit-pushed-branch,
+# test, claim-on-merge-dev, claim-on-merge-main, build-on-tag) into a
+# layered ci/{tests,audits}/<trigger>/ harness fronted by ci-dispatch.yml.
+# What survives at the workflow layer is the dispatcher itself plus the
+# bookkeeping workflows that can't be expressed as required.* scripts
+# (allocator, seed-dev, pr-open validator). The required-check + claim +
+# tag-build behavior now lives as required.*.sh entries under the sys
+# layer at .io.v4rian.how-git/ci/.
+for w in ci-dispatch.yml validate-pr-open.yml; do
+  check_file ".github/workflows/$w"
+done
+
+# Sys-layer required.* dispatchers REQUIRED for core lifecycle
+# (each one fronts an audit/test/claim/build recipe through ci-dispatch.yml)
+for s in \
+  ci/audits/push/required.compile.sh \
+  ci/audits/push/required.coverage.sh \
+  ci/audits/push/required.runtime.sh \
+  ci/tests/push/required.offline-test-suites.sh \
+  ci/audits/pr-merge-dev/required.claim.sh \
+  ci/audits/pr-merge-main/required.claim.sh \
+  ci/audits/tag/required.build.sh; do
+  check_exec ".io.v4rian.how-git/$s"
+done
+
+# Workflows OPTIONAL (template-revision-dependent)
+for w in allocate-pool-branch.yml seed-dev-on-main-create.yml; do
+  : # presence-not-required
+done
+
+# No stray VERSION file
+if [ -f VERSION ]; then
+  ISSUES+=("stray VERSION file at repo root (tags-as-seal model: bin/version is the source); rm VERSION")
+fi
+
+# No stray SERIES file (SERIES is auto-derived from main merge count by bin/version;
+# the file is obsolete under the new model and any presence is a leftover from legacy).
+if [ -f SERIES ]; then
+  ISSUES+=("stray SERIES file at repo root (SERIES is auto-derived from main merge count by bin/version; the file is ignored and should be deleted)")
+fi
+
+# v4rian mode flag
+if [ ! -f .io.v4rian.how-git/MODE ]; then
+  ISSUES+=(".io.v4rian.how-git/MODE missing (defaults to connected; create the file or run bin/set-mode connected)")
+else
+  MODE_VAL=$(tr -d '\n' < .io.v4rian.how-git/MODE)
+  case "$MODE_VAL" in
+    connected|off-grid) ;;
+    *) ISSUES+=(".io.v4rian.how-git/MODE has invalid value '$MODE_VAL' (expected: connected or off-grid)") ;;
+  esac
+fi
+
+# Merge policy + warp (pool -> dev). Warp is announced loudly on stderr
+# even under --quiet, because it lifts the who/PR/approval rules.
+if [ -f .io.v4rian.how-git/scripts/_merge_policy.sh ]; then
+  # shellcheck source=../scripts/_merge_policy.sh
+  . .io.v4rian.how-git/scripts/_merge_policy.sh
+  if [ -f .io.v4rian.how-git/MERGE_POLICY ]; then
+    while IFS= read -r mp_line; do
+      case "$mp_line" in ''|'#'*) continue ;; esac
+      mp_k="${mp_line%%=*}"; mp_v="${mp_line#*=}"
+      case " $MP_KEYS " in
+        *" $mp_k "*) mp_valid "$mp_k" "$mp_v" || ISSUES+=(".io.v4rian.how-git/MERGE_POLICY has invalid value '$mp_v' for $mp_k (bin/set-merge-policy --help)") ;;
+        *) ISSUES+=(".io.v4rian.how-git/MERGE_POLICY has unknown key '$mp_k' (keys: $MP_KEYS)") ;;
+      esac
+    done < .io.v4rian.how-git/MERGE_POLICY
+  fi
+  if [ "$(warp_state)" = "on" ]; then
+    echo "!! WARP MODE ON: pool -> dev merges skip PR, approval and the who rule (bin/warp off to restore MERGE_POLICY)" >&2
+  fi
+fi
+
+# git remote origin
+if ! git config --get remote.origin.url >/dev/null 2>&1; then
+  ISSUES+=("no git remote 'origin' configured")
+fi
+
+# Optional but recommended tools
+command -v python3 >/dev/null 2>&1 || ISSUES+=("python3 not installed (required for several scripts)")
+command -v gh      >/dev/null 2>&1 || ISSUES+=("gh CLI not installed (required for queue, ship, auto-rebase)")
+command -v curl    >/dev/null 2>&1 || ISSUES+=("curl not installed (fallback path for some scripts)")
+
+structural_rc=0
+if [ ${#ISSUES[@]} -gt 0 ]; then
+  structural_rc=1
+  if ! $QUIET; then
+    echo "issues:"
+    for i in ${ISSUES[@]+"${ISSUES[@]}"}; do
+      echo "  - $i"
+    done
+  fi
+elif ! $QUIET; then
+  echo "ok: v4rian repo health check passed (all bins/scripts/hooks/workflows present + executable)"
+fi
+
+# Deep mode: behavioral diagnostics via the framework's test suites.
+# These suites ship at .io.v4rian.how-git/framework-tests/ on the framework source repo
+# AND on consumer installs (per pool/n47 - they stay on consumers as
+# diagnostic tools, not as CI-fires-on-every-push tests). The
+# offline-test workflow gates auto-runs on the FRAMEWORK_REPO marker
+# so consumers never run them via CI; bin/doctor --deep runs them
+# on demand when an operator wants to verify "is my install actually
+# functional, not just structurally complete?"
+deep_rc=0
+if $DEEP; then
+  if ! $QUIET; then
+    echo ""
+    echo "=> deep diagnostics: running .io.v4rian.how-git/framework-tests/ suites (~1m+)"
+  fi
+  if [ ! -d .io.v4rian.how-git/framework-tests ]; then
+    if ! $QUIET; then
+      echo "  warn: .io.v4rian.how-git/framework-tests/ directory absent - install may be incomplete"
+    fi
+    deep_rc=2
+  else
+    if [ -x .io.v4rian.how-git/framework-tests/test-lifecycle.sh ]; then
+      if $QUIET; then
+        LIFECYCLE_TEST_MODE=1 bash .io.v4rian.how-git/framework-tests/test-lifecycle.sh >/dev/null 2>&1 || deep_rc=1
+      else
+        echo "  -> .io.v4rian.how-git/framework-tests/test-lifecycle.sh"
+        LIFECYCLE_TEST_MODE=1 bash .io.v4rian.how-git/framework-tests/test-lifecycle.sh 2>&1 | tail -5
+        LIFECYCLE_TEST_MODE=1 bash .io.v4rian.how-git/framework-tests/test-lifecycle.sh >/dev/null 2>&1 || deep_rc=1
+      fi
+    fi
+    if [ -x .io.v4rian.how-git/framework-tests/test-hooks.sh ]; then
+      if $QUIET; then
+        bash .io.v4rian.how-git/framework-tests/test-hooks.sh >/dev/null 2>&1 || deep_rc=1
+      else
+        echo "  -> .io.v4rian.how-git/framework-tests/test-hooks.sh"
+        bash .io.v4rian.how-git/framework-tests/test-hooks.sh 2>&1 | tail -3
+        bash .io.v4rian.how-git/framework-tests/test-hooks.sh >/dev/null 2>&1 || deep_rc=1
+      fi
+    fi
+    if ! $QUIET; then
+      if [ "$deep_rc" -eq 0 ]; then
+        echo "ok: deep diagnostics passed (framework-tests green)"
+      else
+        echo "X deep diagnostics failed (framework-tests red - your install may have drift)"
+      fi
+    fi
+  fi
+fi
+
+# Final exit: union of structural + deep
+if [ "$structural_rc" -ne 0 ] || [ "$deep_rc" -ne 0 ]; then
+  exit 1
+fi
+exit 0

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# warp - flip warp mode, the prototyping switch for pool -> dev merges.
+#
+# While warp is on, any developer may merge a pool into dev without a PR,
+# whatever MERGE_POLICY says about who, PR and approval: handy while
+# prototyping or before the first launch of a project. Required merge
+# gates (dev_merge_gates) still run, and dev -> main rules are never
+# touched. bin/status, bin/doctor, init-pool-merge, finalize-pool-merge
+# and pre-push announce warp loudly while it is on.
+#
+# The flag lives in .io.v4rian.how-git/WARP ("on" or "off"; absent = off),
+# committed with the repo. Flipping is admin-gated like bin/set-mode and
+# logged as a "[MODE] warp on|off" commit. In connected mode a direct
+# push to dev also needs the server-side dev ruleset to allow it.
+#
+# Usage:
+#   warp on              turn warp on (admin-gated, commits [MODE] warp on)
+#   warp off             turn warp off (admin-gated, commits [MODE] warp off)
+#   warp status          print on or off
+#   warp -h | --help     print this help
+#
+# Exit codes:
+#   0  state printed, already in that state, flipped and committed, or help
+#   2  not a git repo, or an argument other than on, off or status
+#   3  the admin gate refused (connected: not a repo admin or gh unauthenticated)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+case "${1:-}" in -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -z "$REPO_ROOT" ] && { echo "X warp: not inside a git repo" >&2; exit 2; }
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR/scripts/_lib.sh"
+# shellcheck source=../scripts/_merge_policy.sh
+. "$NS_DIR/scripts/_merge_policy.sh"
+
+CURRENT=$(warp_state)
+
+case "${1:-}" in
+  -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  status)    echo "$CURRENT"; exit 0 ;;
+  on|off)    NEW="$1" ;;
+  *)
+    echo "X warp: expected on, off or status (got '${1:-<empty>}')" >&2
+    echo "  current: $CURRENT" >&2
+    exit 2 ;;
+esac
+
+if [ "$NEW" = "$CURRENT" ]; then
+  echo "-> warp already $CURRENT; no change"
+  exit 0
+fi
+
+require_repo_admin warp "$(get_mode)" "flip warp mode"
+
+printf '%s\n' "$NEW" > "$REPO_ROOT/.io.v4rian.how-git/WARP"
+cd "$REPO_ROOT"
+git add .io.v4rian.how-git/WARP
+if [ "$NEW" = "on" ]; then
+  BODY="Turns warp mode on: developers may merge pools into dev without PRs, whatever MERGE_POLICY says about who, PR and approval. Required merge gates still run and dev to main rules are unchanged."
+else
+  BODY="Turns warp mode off: pool to dev merges follow MERGE_POLICY again."
+fi
+git commit -q -m "[MODE] warp $NEW" -m "$BODY"
+if [ "$NEW" = "on" ]; then
+  echo "!! WARP MODE ON committed: pool -> dev merges skip PR, approval and the who rule until 'warp off'"
+else
+  echo "v warp off committed: MERGE_POLICY applies again"
+fi

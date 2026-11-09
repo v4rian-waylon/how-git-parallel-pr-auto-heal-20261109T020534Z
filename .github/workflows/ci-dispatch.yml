@@ -1,0 +1,401 @@
+name: ci-dispatch
+
+# Layered CI dispatcher that loops every script under
+# ci/{tests,audits}/{trigger}/ at the repo root (usr layer, consumer
+# owned) and under .io.v4rian.how-git/ci/{tests,audits}/{trigger}/
+# (sys layer, framework owned, runs only when the FRAMEWORK_REPO
+# marker is present). Each .sh becomes a separate status check whose
+# context name is the basename minus the .sh extension; required.*
+# files are bound as required checks by bin/bootstrap-ci.
+#
+# The triggers covered by this scaffolding bundle:
+#   push           every push to any branch
+#   pr-open        pull_request opened/synchronize/reopened into dev/main
+#   pr-merge-dev   pull_request closed-merged into dev
+#   pr-merge-main  pull_request closed-merged into main
+#   tag            v* tag push
+#
+# The current bundle wires push end to end as the proof of concept
+# (the prior compile / coverage / runtime / offline test suites
+# checks now live under .io.v4rian.how-git/ci/{tests,audits}/push/
+# required.*.sh; they run on the push event that lands the head SHA
+# and the PR reuses the result by context name on pr-open). The
+# opened-via-correct-flow check stays on pr-open via
+# validate-pr-open.yml. Subsequent bundles extend the other triggers
+# in the same shape.
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  # Reusable entry for the thin on-demand workflows (audit-pushed-branch,
+  # dev-merge, main-merge, build-on-tag). They carry no event trigger of
+  # their own and call this file with an explicit trigger label, so one
+  # engine owns every fan-out and no job ever runs twice per event. The
+  # off-grid twin of each caller is `bin/ci-local --workflow <name>`.
+  workflow_call:
+    inputs:
+      trigger:
+        description: 'Trigger label to fan out: push, pr-open, pr-merge-dev, pr-merge-main or tag.'
+        required: true
+        type: string
+      ref:
+        description: 'Ref to check out (branch, tag or SHA). Empty keeps the caller event ref. For trigger=tag it also names the tag being built.'
+        required: false
+        type: string
+        default: ''
+    # Callers pass these by name (never `secrets: inherit`); GITHUB_TOKEN
+    # reaches a called workflow without being passed.
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+      ANTHROPIC_API_KEY:
+        required: false
+      CI_BOT_APP_PRIVATE_KEY:
+        required: false
+
+# The pull_request event is intentionally NOT a trigger here. The
+# framework's design is that audits are push-time auditors of the head
+# SHA; when a PR opens or syncs against an already-pushed SHA, GitHub
+# branch protection looks up the required status checks by name on the
+# head SHA and finds the push-published results without re-running.
+# validate-pr-open.yml owns the pr-open work that IS specific to the PR
+# event (title + body shape, opened-via-correct-flow). Claim-on-merge
+# fires from the post-merge push to dev or main (refs/heads/dev or
+# refs/heads/main), not from the pull_request closed-merged event,
+# because both events fire at the same time and one engine is enough.
+
+# Read-only by default (docs/ci-trust-model.md): this file runs from the
+# pushed ref, so only the check-trusted job, bound to the v4rian-trusted
+# environment that admits dev, main and v* tags alone, gets write scopes
+# and secrets.
+permissions:
+  contents: read
+
+# Cancel stale runs on the same ref so a quick follow-up push does
+# not race the prior fan-out.
+concurrency:
+  group: ci-dispatch-${{ github.workflow }}-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # resolve: pick the right trigger label for this event, then list every
+  # .sh under ci/{tests,audits}/<trigger>/ across the usr + sys layers and
+  # emit the matrix in a single JSON output. Downstream jobs fan out one
+  # runner per script.
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: resolve trigger and matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      trigger: ${{ steps.pick.outputs.trigger }}
+      matrix:  ${{ steps.list.outputs.matrix }}
+      empty:   ${{ steps.list.outputs.empty }}
+    steps:
+      # Trusted checkout first (the event ref, or the dispatch ref a caller
+      # was started on): the validator below must not come from the ref it
+      # judges.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: verify the requested ref belongs to this repo
+        if: inputs.ref != ''
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: bash .io.v4rian.how-git/scripts/workflows/verify-dispatch-ref.sh "$INPUT_REF"
+
+      - name: check out the requested ref
+        if: inputs.ref != ''
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref }}
+
+      - name: pick trigger label
+        id: pick
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_ACTION:  ${{ github.event.action }}
+          PR_MERGED:  ${{ github.event.pull_request.merged }}
+          BASE_REF:   ${{ github.event.pull_request.base.ref }}
+          GIT_REF:    ${{ github.ref }}
+          HEAD_MSG:   ${{ github.event.head_commit.message }}
+          INPUT_TRIGGER: ${{ inputs.trigger }}
+        run: |
+          set -uo pipefail
+          trigger=""
+          if [ -n "$INPUT_TRIGGER" ]; then
+            # workflow_call from a thin entry: the caller names the trigger.
+            case "$INPUT_TRIGGER" in
+              push|pr-open|pr-merge-dev|pr-merge-main|tag) trigger="$INPUT_TRIGGER" ;;
+              *) echo "X ci-dispatch: unknown trigger input '$INPUT_TRIGGER'" >&2; exit 1 ;;
+            esac
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            if [ "$PR_ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ]; then
+              case "$BASE_REF" in
+                dev)  trigger="pr-merge-dev" ;;
+                main) trigger="pr-merge-main" ;;
+              esac
+            else
+              trigger="pr-open"
+            fi
+          elif [ "$EVENT_NAME" = "push" ]; then
+            # Skip the workflow's own bump commits to avoid loops on dev/main.
+            case "$HEAD_MSG" in
+              "chore(version):"*)
+                echo "=> ci-dispatch: skipping chore(version) self-push to avoid loop"
+                echo "trigger=" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+            case "$GIT_REF" in
+              refs/tags/v*)    trigger="tag" ;;
+              refs/heads/dev)  trigger="pr-merge-dev" ;;
+              refs/heads/main) trigger="pr-merge-main" ;;
+              refs/heads/*)    trigger="push" ;;
+            esac
+          fi
+          # Off-grid repos run their ci tree locally (bin/ci-local) and claim
+          # locally (finalize-pool-merge, ship); event-driven remote runs stay
+          # inert so a push never spends Actions minutes or races a local
+          # claim. A thin manual entry (INPUT_TRIGGER) still runs on request.
+          if [ -n "$trigger" ] && [ -z "$INPUT_TRIGGER" ] \
+             && [ "$(tr -d '[:space:]' < .io.v4rian.how-git/MODE 2>/dev/null)" = "off-grid" ]; then
+            echo "=> ci-dispatch: repo is off-grid; event trigger=$trigger is inert (run bin/ci-local)"
+            echo "## ci-dispatch: off-grid, trigger=$trigger inert (bin/ci-local runs this tree locally)" >> "$GITHUB_STEP_SUMMARY"
+            echo "trigger=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$trigger" ]; then
+            echo "=> ci-dispatch: no trigger label resolved for $EVENT_NAME (action=$PR_ACTION merged=$PR_MERGED base=$BASE_REF ref=$GIT_REF); nothing to do"
+            echo "trigger=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "=> ci-dispatch: trigger=$trigger"
+          echo "trigger=$trigger" >> "$GITHUB_OUTPUT"
+
+      - name: enumerate scripts
+        id: list
+        env:
+          TRIGGER: ${{ steps.pick.outputs.trigger }}
+        run: |
+          set -uo pipefail
+          if [ -z "$TRIGGER" ]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Enumerate every (layer, kind, script) tuple this trigger
+          # produces. The dispatcher's --list mode emits TAB-separated
+          # lines; we transform that into the matrix include array.
+          mapfile -t lines < <(bash .io.v4rian.how-git/scripts/workflows/ci-dispatch.sh --trigger "$TRIGGER" --list)
+          if [ "${#lines[@]}" -eq 0 ]; then
+            echo "=> ci-dispatch: no scripts matched trigger=$TRIGGER"
+            # An empty matrix completing green is indistinguishable from gates
+            # that ran - make the emptiness visible on the run summary so
+            # "nothing executed" can never read as "everything passed".
+            {
+              echo "## :warning: ci-dispatch ran ZERO scripts (trigger=$TRIGGER)"
+              echo "No usr-layer scripts exist under \`ci/{tests,audits}/$TRIGGER/\` (and no sys layer applies)."
+              echo "If this repo should be gated, add scripts there - see .io.v4rian.how-git/ci/ for the convention."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Build JSON via the matrix-build script. Inlined Python is unsafe
+          # here because a YAML block scalar terminates at the first
+          # dedent below the block indent, and Python's top-level
+          # statements cannot be indented to keep the block alive.
+          export LINES_JSON
+          LINES_JSON=$(printf '%s\n' "${lines[@]}" \
+            | python3 .io.v4rian.how-git/scripts/workflows/ci-dispatch-matrix-build.py)
+          echo "matrix=$LINES_JSON" >> "$GITHUB_OUTPUT"
+          echo "empty=false" >> "$GITHUB_OUTPUT"
+          echo "=> matrix: $LINES_JSON"
+
+  # ---------------------------------------------------------------------------
+  # check: one runner per discovered script. The status check name is
+  # exactly the script's check name (basename minus .sh) so branch
+  # protection bindings resolve directly to this job's name. GitHub
+  # surfaces the matrix display name in the PR conversation; we set it
+  # to the check name so the PR-side reader sees the expected gate.
+  # ---------------------------------------------------------------------------
+  # check: gates of an untrusted ref (push to any branch, pr-open). They run
+  # the ref's own code, so they get a read-only token and no secret; the
+  # job's conclusion is the status check.
+  check:
+    name: ${{ matrix.check }}
+    needs: resolve
+    if: needs.resolve.outputs.empty == 'false' && (needs.resolve.outputs.trigger == 'push' || needs.resolve.outputs.trigger == 'pr-open')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: configure local git identity for any test commits
+        run: |
+          git config --global user.name "v4rian-ci"
+          git config --global user.email "ci@v4rian.local"
+
+      - name: run ${{ matrix.layer }}/${{ matrix.kind }}/${{ matrix.basename }}
+        env:
+          CI_TRIGGER:    ${{ needs.resolve.outputs.trigger }}
+          CI_LAYER:      ${{ matrix.layer }}
+          CI_KIND:       ${{ matrix.kind }}
+          CI_CHECK_NAME: ${{ matrix.check }}
+          CI_REQUIRED:   ${{ matrix.required }}
+          GH_TOKEN:      ${{ github.token }}
+        run: |
+          set -uo pipefail
+          echo "=> ci-dispatch [$CI_TRIGGER] $CI_LAYER/$CI_KIND/${{ matrix.basename }} (required=$CI_REQUIRED, untrusted: no secrets)"
+          bash "${{ matrix.script }}"
+
+  # check-trusted: claims and tag builds. Their triggers only fire on dev,
+  # main and v* tags, and the v4rian-trusted environment admits only those
+  # refs, so a branch that edits this file to claim a trusted trigger still
+  # gets no secret.
+  check-trusted:
+    name: ${{ matrix.check }}
+    needs: resolve
+    if: needs.resolve.outputs.empty == 'false' && (needs.resolve.outputs.trigger == 'pr-merge-dev' || needs.resolve.outputs.trigger == 'pr-merge-main' || needs.resolve.outputs.trigger == 'tag')
+    runs-on: ubuntu-latest
+    environment: v4rian-trusted
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+      checks: write
+      issues: write
+      id-token: write
+      actions: read
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: configure local git identity for any test commits
+        run: |
+          git config --global user.name "v4rian-ci"
+          git config --global user.email "ci@v4rian.local"
+
+      # Mint a GitHub App installation token whose pushes are recognized as
+      # an external actor (not GITHUB_TOKEN), so a tag pushed by the claim
+      # script triggers the downstream tag-event workflows. GitHub's recursion
+      # guard suppresses tag-event workflows when the pushing identity is the
+      # workflow's own GITHUB_TOKEN - using the CI bot App's installation token
+      # bypasses that guard cleanly. When the App secrets are absent on a fresh
+      # consumer install, the step is skipped and CLAIM_TAG_PUSH_TOKEN stays
+      # unset; the claim script then falls back to GITHUB_TOKEN with the prior
+      # behavior. Operator action: set CI_BOT_APP_ID + CI_BOT_APP_PRIVATE_KEY
+      # secrets on the repo (or the org) to enable downstream tag workflows.
+      - name: Mint CI bot App token for tag-push (optional)
+        id: ci_bot_app_token
+        if: vars.CI_BOT_APP_ID != '' || env.CI_BOT_APP_ID_HAS_VALUE == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CI_BOT_APP_ID }}
+          private-key: ${{ secrets.CI_BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      # Install the Claude Code CLI on the runner so the framework's
+      # claude-using audits (commit-audit per-push, claim per pr-merge-dev)
+      # have a real claude binary to invoke. ubuntu-latest does NOT ship
+      # claude pre-installed per the runner-images manifest
+      # (https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md),
+      # so without this step every claude_judge_commit invocation hits
+      # the "claude CLI unavailable" WARN branch in scripts/_lib.sh and
+      # the semantic layer silently no-ops. Installation uses the
+      # official Anthropic install script (the same one anthropics/
+      # claude-code-base-action calls under the hood) at the pinned
+      # version 2.1.150. Skipped for matrix children that do not invoke
+      # claude (compile, coverage, runtime, offline-test-suites) to
+      # keep the ~10s install cost off the non-claude path.
+      - name: Install Claude Code (background)
+        if: contains(matrix.basename, 'commit-audit') || contains(matrix.basename, 'claim')
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Backgrounded so the audit script starts immediately: the claim's
+          # PR-facing signals (start comments, status) previously waited ~25s
+          # behind this install. ensure_claude_ready() in _lib.sh joins on the
+          # marker before any claude invocation.
+          CLAUDE_CODE_VERSION="2.1.150"
+          echo "Installing Claude Code v${CLAUDE_CODE_VERSION} in the background..."
+          nohup bash -c '
+            for attempt in 1 2 3; do
+              if curl -fsSL https://claude.ai/install.sh | bash -s -- "'"$CLAUDE_CODE_VERSION"'"; then
+                echo ok > /tmp/.claude-install.done; exit 0
+              fi
+              sleep 5
+            done
+            echo fail > /tmp/.claude-install.done; exit 1
+          ' > /tmp/.claude-install.log 2>&1 &
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: run ${{ matrix.layer }}/${{ matrix.kind }}/${{ matrix.basename }}
+        id: primary
+        env:
+          CI_TRIGGER:    ${{ needs.resolve.outputs.trigger }}
+          CI_LAYER:      ${{ matrix.layer }}
+          CI_KIND:       ${{ matrix.kind }}
+          CI_CHECK_NAME: ${{ matrix.check }}
+          CI_REQUIRED:   ${{ matrix.required }}
+          # Tag being built when a thin entry (build-on-tag) calls with
+          # trigger=tag; empty otherwise, so required.build.sh falls back to
+          # the pushed tag ref.
+          TAG:           ${{ inputs.trigger == 'tag' && inputs.ref || '' }}
+          GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          # claude credential pair for any audit/test under matrix that
+          # reaches claude (commit-audit semantic layer, doc-freshness
+          # rewriter, etc.). CLAUDE_CODE_OAUTH_TOKEN is the preferred
+          # path (Max-plan subscription); ANTHROPIC_API_KEY remains the
+          # fallback. Both empty leaves claude-using gates skipping with
+          # a visible WARN per scripts/_lib.sh::claude_judge_commit.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # CLAIM_TAG_PUSH_TOKEN carries the App installation token when the
+          # CI bot App is configured for this repo. claim-dev-merge.sh and
+          # claim-main-release.sh use this token for the tag push so the
+          # resulting tag event fires downstream workflows (build-on-tag /
+          # ci-dispatch tag trigger). Empty when the App secrets are absent;
+          # the claim scripts then fall back to plain git push, which retains
+          # the prior behavior of suppressed tag workflows.
+          CLAIM_TAG_PUSH_TOKEN: ${{ steps.ci_bot_app_token.outputs.token }}
+        run: |
+          set -uo pipefail
+          echo "=> ci-dispatch [$CI_TRIGGER] $CI_LAYER/$CI_KIND/${{ matrix.basename }} (required=$CI_REQUIRED)"
+          bash "${{ matrix.script }}"
+

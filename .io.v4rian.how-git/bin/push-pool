@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# push-pool - push a pool branch and its safety anchor together, with an
+# explicit lease that works through a one-off auth URL.
+#
+# A push by URL (git push https://<token>@github.com/o/r ...) updates no
+# remote-tracking ref, so a later plain --force-with-lease compares against
+# a stale or missing tracking ref and bounces with "stale info". push-pool
+# reads the destination's current value with ls-remote and leases on it
+# explicitly, and only when this clone has seen that commit (it is in the
+# pool's history or its reflog); a remote that moved to a commit this clone
+# never had is refused, never overwritten. --expect SHA pins the lease.
+#
+# The pair goes in one --atomic push: pool/<lane> (rewrite allowed under
+# the lease) and safety/<lane> when it exists locally (never rewritten: a
+# plain refspec, so a moved safety anchor is refused by git itself). The
+# pre-push hook runs as usual.
+#
+# Usage:
+#   push-pool [--remote NAME | --url URL] [--expect SHA] [--dry-run] <pool/branch>
+#     <pool/branch>   pool/[vYYYY.N/]nN.kind.slug; default: the current branch
+#     --remote NAME   destination remote (default origin)
+#     --url URL       destination URL instead of a remote (token URLs welcome;
+#                     the URL is never printed)
+#     --expect SHA    lease on SHA instead of the advertised value
+#     --dry-run       print the push it would run, push nothing
+#   push-pool -h | --help
+#
+# Exit codes:
+#   0  pushed (or dry run printed, or help)
+#   1  push rejected (lease, hook, or remote)
+#   2  bad arguments, not a pool branch, or the remote moved to a commit
+#      this clone never saw
+
+set -euo pipefail
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit "${1:-0}"; }
+
+REMOTE=origin URL="" EXPECT="" DRY=false POOL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remote) REMOTE="${2:?}"; shift 2 ;;
+    --url)    URL="${2:?}"; shift 2 ;;
+    --expect) EXPECT="${2:?}"; shift 2 ;;
+    --dry-run) DRY=true; shift ;;
+    -h|--help) usage 0 ;;
+    -*) echo "X push-pool: unknown flag $1" >&2; usage 2 ;;
+    *)  POOL="$1"; shift ;;
+  esac
+done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "X push-pool: not inside a git repo" >&2; exit 2; }
+# shellcheck source=../scripts/_lib.sh
+. "$REPO_ROOT/.io.v4rian.how-git/scripts/_lib.sh"
+
+[ -n "$POOL" ] || POOL=$(git rev-parse --abbrev-ref HEAD)
+POOL="${POOL#refs/heads/}"
+case "$POOL" in pool/*) ;; *) echo "X push-pool: '$POOL' is not a pool/* branch" >&2; exit 2 ;; esac
+git rev-parse -q --verify "refs/heads/$POOL" >/dev/null || { echo "X push-pool: no local branch $POOL" >&2; exit 2; }
+SAFETY="safety/${POOL#pool/}"
+DEST="${URL:-$REMOTE}"
+SHOWN="${URL:+<url>}"; SHOWN="${SHOWN:-$REMOTE}"
+
+remote_sha() {
+  GIT_TERMINAL_PROMPT=0 git ls-remote "$DEST" "refs/heads/$1" </dev/null 2>/dev/null | awk 'NR == 1 {print $1}'
+}
+
+POOL_TIP=$(git rev-parse "refs/heads/$POOL")
+CUR=$(remote_sha "$POOL")
+if [ -n "$EXPECT" ]; then
+  LEASE=$(git rev-parse -q --verify "$EXPECT^{commit}" 2>/dev/null || printf '%s' "$EXPECT")
+elif [ -z "$CUR" ]; then
+  LEASE=""
+elif git merge-base --is-ancestor "$CUR" "$POOL_TIP" 2>/dev/null \
+    || case " $(git rev-list -g "refs/heads/$POOL" 2>/dev/null | tr '\n' ' ') " in *" $CUR "*) true ;; *) false ;; esac; then
+  LEASE="$CUR"
+else
+  echo "X push-pool: $SHOWN $POOL is at $CUR, a commit this clone never had." >&2
+  echo "  Someone else pushed it. Fetch and inspect before overwriting:" >&2
+  echo "    git fetch $SHOWN refs/heads/$POOL && git log --oneline $POOL..FETCH_HEAD" >&2
+  echo "  then rerun with --expect $CUR to replace it knowingly." >&2
+  exit 2
+fi
+
+ARGS=(--atomic "--force-with-lease=refs/heads/$POOL:$LEASE" "$DEST" "refs/heads/$POOL:refs/heads/$POOL")
+if git rev-parse -q --verify "refs/heads/$SAFETY" >/dev/null; then
+  ARGS+=("refs/heads/$SAFETY:refs/heads/$SAFETY")
+fi
+
+if $DRY; then
+  echo "[dry-run] git push --atomic --force-with-lease=refs/heads/$POOL:${LEASE:-<absent>} $SHOWN $POOL${ARGS[4]:+ $SAFETY}"
+  exit 0
+fi
+if ! git push -q ${ARGS[@]+"${ARGS[@]}"}; then
+  echo "X push-pool: push of $POOL to $SHOWN rejected (lease ${LEASE:-<absent>})" >&2
+  exit 1
+fi
+echo "-> pushed $POOL ($POOL_TIP)${ARGS[4]:+ and $SAFETY} to $SHOWN"

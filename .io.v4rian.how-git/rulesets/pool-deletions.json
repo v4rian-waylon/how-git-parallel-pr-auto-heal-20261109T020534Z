@@ -1,0 +1,27 @@
+{
+  "_comment": "v4rian pool/* deletion lock. Developers NEVER delete branches - theirs or anyone else's - and CI never deletes either: the vault receipt is the archive, the merged pool ref lingers until an admin sweep (bin/post-merge-lifecycle). Covers reconcile candidates too (the auto-rebase rolls them forward by force-pushing the canonical name in place, never by deleting). Bypass actors: repository admins only. Apply via .io.v4rian.how-git/scripts/apply-repo-rules.sh.",
+  "name": "v4rian-pool-deletions",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/heads/pool/*",
+        "refs/heads/pool/*/*"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "deletion"
+    }
+  ],
+  "bypass_actors": [
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# changelog - generate a markdown changelog from git tags + commits.
+#
+# Walks v* tags in chronological order, listing the commits in each
+# release range. Useful for compiling release notes after a string of
+# dev claims. Output goes to stdout; redirect to CHANGELOG.md or paste
+# into a PR.
+#
+# Usage:
+#   changelog                  full changelog, all tags this year
+#   changelog --since TAG      from TAG (exclusive) to HEAD
+#   changelog --range A..B     between tags A and B
+#   changelog -h | --help
+#
+# Read-only: prints to stdout, writes no file and moves no ref.
+#
+# Exit codes:
+#   0  changelog printed (also when no v<year>.* tag exists yet)
+#   2  not inside a git repo, or an unknown flag
+
+set -uo pipefail
+
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+# --help works anywhere, before the repo check below.
+for _arg in "$@"; do
+  case "$_arg" in -h|--help) usage ;; esac
+done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X changelog: not inside a git repo" >&2
+  exit 2
+fi
+
+SINCE=""
+RANGE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) SINCE="$2"; shift 2 ;;
+    --range) RANGE="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+cd "$REPO_ROOT"
+
+NOW_YEAR=$(date -u +%Y)
+
+# Get tags in chronological order
+TAGS=$(git for-each-ref --sort=creatordate --format='%(refname:short)' "refs/tags/v${NOW_YEAR}.*" 2>/dev/null)
+if [ -z "$TAGS" ]; then
+  echo "# Changelog"
+  echo
+  echo "_No tags this year (${NOW_YEAR})._"
+  exit 0
+fi
+
+echo "# Changelog"
+echo
+
+if [ -n "$RANGE" ]; then
+  # Specific range
+  echo "## $RANGE"
+  echo
+  git log --reverse --pretty='- %s (%h)' "$RANGE" 2>/dev/null || echo "  (could not compute range)"
+  echo
+  exit 0
+fi
+
+if [ -n "$SINCE" ]; then
+  # From given tag to HEAD
+  echo "## ${SINCE}..HEAD"
+  echo
+  git log --reverse --pretty='- %s (%h)' "${SINCE}..HEAD" 2>/dev/null
+  echo
+  exit 0
+fi
+
+# Full year changelog: section per tag, in reverse-chrono (latest first)
+TAGS_ARR=()
+while IFS= read -r t; do TAGS_ARR+=("$t"); done <<< "$TAGS"
+
+# Reverse iterate
+for ((i=${#TAGS_ARR[@]}-1; i>=0; i--)); do
+  tag="${TAGS_ARR[i]}"
+  if [ "$i" -eq 0 ]; then
+    # First tag this year: include all commits leading to it
+    RANGE_DESC="$tag"
+  else
+    PREV_TAG="${TAGS_ARR[i-1]}"
+    RANGE_DESC="${PREV_TAG}..${tag}"
+  fi
+  TAG_DATE=$(git log -1 --format='%ai' "$tag" 2>/dev/null | awk '{print $1}')
+  echo "## $tag ($TAG_DATE)"
+  echo
+  COMMITS=$(git log --reverse --pretty='- %s (%h)' "$RANGE_DESC" 2>/dev/null | grep -v '^- \[MERGE\]' | grep -v 'chore(version)')
+  if [ -n "$COMMITS" ]; then
+    echo "$COMMITS"
+  else
+    echo "  _(no substantive commits in this range)_"
+  fi
+  echo
+done

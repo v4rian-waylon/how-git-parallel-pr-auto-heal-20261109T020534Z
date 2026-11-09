@@ -1,0 +1,277 @@
+name: canaries
+
+# Orchestrator for the three operator-run throwaway canaries:
+#
+#   - verify-template            (.io.v4rian.how-git/scripts/verify-template.sh)
+#       Static + behavioral invariants on a freshly templated throwaway.
+#
+#   - test-off-grid-e2e          (.io.v4rian.how-git/bin/test-off-grid-e2e)
+#       Full off-grid lifecycle (pool/n1, finalize-pool-merge, ship) against
+#       a real throwaway repo where no workflow fires.
+#
+#   - test-parallel-pr-auto-heal-canary
+#                                (.io.v4rian.how-git/bin/test-parallel-pr-auto-heal-canary)
+#       Parallel-PR auto-heal scenario (two pool branches conflicting on the
+#       same hunk, first merges, second is rebased + reconciled).
+#
+# Each canary creates a real GitHub repo, drives a full lifecycle on it, and
+# deletes it on success. Cost per invocation is non-trivial: one repo
+# creation, one repo deletion, and several API calls in between. The trigger
+# matrix is sized to that cost.
+#
+# Triggers:
+#
+#   workflow_dispatch    Manual operator dispatch from the GitHub UI or via
+#                        `gh workflow run canaries.yml`. The `canary` input
+#                        picks one of the three (or `all` to run every
+#                        canary in parallel). This preserves the historic
+#                        operator-run posture: an admin can always fire a
+#                        canary on demand without waiting for a schedule.
+#
+#   schedule             Nightly cron at 08:17 UTC. Spaced off the hour so
+#                        it does not collide with other org-level scheduled
+#                        runs. Predictable budget cap (one full sweep per
+#                        24h) and catches overnight drift in the consumer
+#                        flow without burning per-push budget. Runs only
+#                        against the framework source repo's default
+#                        branch; the schedule trigger uses the default
+#                        branch's workflow file per GitHub semantics.
+#
+#   (no pull_request)    a PR trigger would run the PR head's canary
+#                        scripts with CANARY_TOKEN; before a release,
+#                        dispatch the sweep on dev instead.
+#
+# Push triggers (push to dev or push of v* tags) are intentionally NOT
+# wired here. Every claim cycle into dev would burn three real repo
+# creations under the unmodified token, and tag pushes overlap with the
+# pre-release main PR's pre-merge canary fire with less precision.
+#
+# Token + account:
+#
+#   secrets.CANARY_TOKEN     GitHub PAT or App-installation token with
+#                            repo + delete_repo scope on the destination
+#                            account. The canaries refuse to fall back to
+#                            GITHUB_TOKEN because GITHUB_TOKEN cannot
+#                            create or delete repos in another owner and
+#                            the canaries are designed to NEVER touch the
+#                            framework's own repos.
+#
+#   vars.CANARY_ACCOUNT      Owner under which throwaways are created. The
+#                            canaries refuse to guess this even when the
+#                            token implicitly identifies an actor; this is
+#                            the belt-and-suspenders guard against
+#                            cross-account PAT mistakes deleting the
+#                            wrong repo.
+#
+#   vars.CANARY_VISIBILITY   Optional. "public" passes --public so the
+#                            throwaways are public repos: a free plan gives
+#                            private repos no branch protection or
+#                            rulesets, so the connected canary needs one.
+#                            Anything else (or unset) keeps them private.
+#
+# When either is missing the job posts a SKIPPED summary and exits 0 (the
+# canary stays advisory; missing credentials never red the workflow). The
+# "CI never crashes - completes or skips" discipline is in effect.
+
+on:
+  workflow_dispatch:
+    inputs:
+      canary:
+        description: 'Which canary to run (verify-template | test-off-grid-e2e | test-parallel-pr-auto-heal-canary | all)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - 'verify-template'
+          - 'test-off-grid-e2e'
+          - 'test-parallel-pr-auto-heal-canary'
+  schedule:
+    # 08:17 UTC nightly. Off-the-hour to avoid org-level cron collisions.
+    - cron: '17 8 * * *'
+# No pull_request trigger: it would run the PR head's canary scripts with
+# CANARY_TOKEN, which can create and delete repositories on the canary
+# account (docs/ci-trust-model.md). Run the sweep before a release with
+# workflow_dispatch on dev.
+
+permissions:
+  contents: read
+
+# Serialize across the same ref so a fast follow-up event does not race the
+# prior canary sweep (the canaries do create/delete real repos and overlap
+# would step on the per-account name slug clock).
+concurrency:
+  group: canaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # resolve: pick the canary set for this event. workflow_dispatch honors the
+  # `canary` input; every other trigger runs the full set. Each entry in the
+  # matrix carries the canary's bin path and a human-readable label.
+  # A canary whose bin file is not present on this SHA is filtered out so
+  # the workflow stays green across the transition window where a follow-on
+  # PR adds a new canary script.
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: resolve canary set
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      empty:  ${{ steps.pick.outputs.empty }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: pick canary set
+        id: pick
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PICK:       ${{ github.event.inputs.canary }}
+        run: |
+          set -uo pipefail
+          # Consumer gate: canaries are framework SELF-tests (template e2e,
+          # allocator healing, off-grid flows). On a consumer repo (no
+          # FRAMEWORK_REPO marker) they are meaningless noise on PRs - emit an
+          # empty set and say so. Rule-enforcement gates (validate-pr-open,
+          # ci-dispatch layers, doc-freshness) are untouched; they ARE the
+          # product on consumers.
+          if [ ! -f ".io.v4rian.how-git/FRAMEWORK_REPO" ]; then
+            echo "=> canaries: consumer repo (FRAMEWORK_REPO marker absent); framework self-tests do not apply"
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Source of truth for canary entries. Add a new canary by appending
+          # a single line here; the filter logic below picks it up.
+          ALL_JSON='[
+            {"label":"verify-template","bin":".io.v4rian.how-git/scripts/verify-template.sh"},
+            {"label":"test-off-grid-e2e","bin":".io.v4rian.how-git/bin/test-off-grid-e2e"},
+            {"label":"test-parallel-pr-auto-heal-canary","bin":".io.v4rian.how-git/bin/test-parallel-pr-auto-heal-canary"}
+          ]'
+          SELECT="${PICK:-all}"
+          # Honor the workflow_dispatch single-canary selection. The schedule
+          # always runs the full set.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$SELECT" != "all" ] && [ -n "$SELECT" ]; then
+            ALL_JSON=$(echo "$ALL_JSON" | jq --arg sel "$SELECT" '[.[] | select(.label==$sel)]')
+          fi
+          # Drop entries whose bin is not present on disk for this SHA.
+          INCLUDE='[]'
+          while read -r row; do
+            [ -z "$row" ] && continue
+            bin=$(echo "$row" | jq -r '.bin')
+            label=$(echo "$row" | jq -r '.label')
+            if [ -e "$bin" ]; then
+              INCLUDE=$(echo "$INCLUDE" | jq --argjson r "$row" '. += [$r]')
+            else
+              echo "=> canaries: skipping $label (bin $bin not present on this SHA)"
+            fi
+          done < <(echo "$ALL_JSON" | jq -c '.[]')
+          COUNT=$(echo "$INCLUDE" | jq 'length')
+          MATRIX=$(jq -nc --argjson inc "$INCLUDE" '{include:$inc}')
+          echo "=> canaries: selected count=$COUNT"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # canary: one runner per selected canary. Skips cleanly when the operator
+  # secret (CANARY_TOKEN) or account variable (CANARY_ACCOUNT) is missing.
+  # Per the "CI never crashes - completes or skips" rule, missing credentials
+  # never red the workflow; the skip is posted to the job summary so the
+  # operator can wire the secret without chasing a red check.
+  # ---------------------------------------------------------------------------
+  canary:
+    name: ${{ matrix.label }}
+    # CANARY_TOKEN lives only in the v4rian-canary environment, which admits
+    # dev and main alone; a branch that edits this file reads nothing.
+    environment: v4rian-canary
+    needs: resolve
+    if: needs.resolve.outputs.empty == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: configure git identity for the canary's local commits
+        run: |
+          git config --global user.name "v4rian-ci"
+          git config --global user.email "ci@v4rian.local"
+
+      - name: verify CANARY_TOKEN + CANARY_ACCOUNT presence
+        id: creds
+        env:
+          CANARY_TOKEN:   ${{ secrets.CANARY_TOKEN }}
+          CANARY_ACCOUNT: ${{ vars.CANARY_ACCOUNT }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CANARY_TOKEN:-}" ] || [ -z "${CANARY_ACCOUNT:-}" ]; then
+            TOK_STATE="MISSING"
+            ACT_STATE="MISSING"
+            [ -n "${CANARY_TOKEN:-}" ] && TOK_STATE="present"
+            [ -n "${CANARY_ACCOUNT:-}" ] && ACT_STATE="$CANARY_ACCOUNT"
+            {
+              echo "## ${{ matrix.label }}: SKIPPED"
+              echo ""
+              echo "Required secrets / vars are not configured on this repo:"
+              echo ""
+              echo "- secrets.CANARY_TOKEN: $TOK_STATE"
+              echo "- vars.CANARY_ACCOUNT:  $ACT_STATE"
+              echo ""
+              echo "Configure both on the repo (or the org) to enable scheduled and pre-release canary runs."
+              echo "Each canary creates and deletes a real GitHub repo per invocation; the token must carry"
+              echo "repo + delete_repo scope on the destination account."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "=> canaries [${{ matrix.label }}]: SKIPPED (CANARY_TOKEN or CANARY_ACCOUNT missing)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: run ${{ matrix.label }}
+        if: steps.creds.outputs.skip != 'true'
+        env:
+          CANARY_TOKEN:   ${{ secrets.CANARY_TOKEN }}
+          CANARY_ACCOUNT: ${{ vars.CANARY_ACCOUNT }}
+          CANARY_VISIBILITY: ${{ vars.CANARY_VISIBILITY }}
+          # GH_TOKEN is honored by verify-template.sh's token resolution
+          # chain (it has no --token flag). The other two canaries read
+          # --token explicitly.
+          GH_TOKEN:       ${{ secrets.CANARY_TOKEN }}
+        run: |
+          set -uo pipefail
+          VIS=()
+          [ "${CANARY_VISIBILITY:-}" = "public" ] && VIS=(--public)
+          echo "=> canaries [${{ matrix.label }}]: starting against account=$CANARY_ACCOUNT visibility=${CANARY_VISIBILITY:-private}"
+          case "${{ matrix.label }}" in
+            verify-template)
+              # verify-template.sh has no --token flag; it consumes GH_TOKEN
+              # via throwaway_resolve_token (_throwaway_lib.sh). It auto-resolves the destination
+              # owner from the authenticated user when --dest-owner is absent,
+              # but we pass it explicitly to keep the canary anchored to the
+              # configured CANARY_ACCOUNT.
+              bash "${{ matrix.bin }}" --from-branch dev --dest-owner "$CANARY_ACCOUNT" ${VIS[@]+"${VIS[@]}"}
+              ;;
+            test-off-grid-e2e | test-parallel-pr-auto-heal-canary)
+              bash "${{ matrix.bin }}" --token "$CANARY_TOKEN" --account "$CANARY_ACCOUNT" ${VIS[@]+"${VIS[@]}"}
+              ;;
+            *)
+              echo "X canaries: unknown label '${{ matrix.label }}'" >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "## ${{ matrix.label }}: PASSED"
+            echo ""
+            echo "Canary ran end-to-end against account=$CANARY_ACCOUNT. Throwaway was created, exercised, and deleted."
+          } >> "$GITHUB_STEP_SUMMARY"

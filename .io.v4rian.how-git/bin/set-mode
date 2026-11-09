@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# set-mode - flip the v4rian repo mode between connected and off-grid.
+#
+# Modes:
+#   connected - claim ceremonies (title amend + tag + vault) run on the
+#               remote side via GitHub Actions. The merge can be triggered
+#               via the UI button, `init-pool-merge --merge`, or
+#               `init-release --merge`. The off-grid CLIs refuse to run.
+#   off-grid  - claim ceremonies run locally via `finalize-pool-merge`
+#               (pool→dev) or `ship` (dev→main). The connected-mode
+#               entry points (init-pool-merge, init-release, claim
+#               workflows) refuse to run.
+#
+# The mode lives in .io.v4rian.how-git/MODE and is committed to the
+# repo (mode is a repo property, not a per-clone setting). Flipping
+# to connected is admin-gated: the actor's GitHub admin permission is
+# checked via the collaborators API before the flip is committed. Flipping
+# to off-grid is local and needs no admin.
+#
+# Usage:
+#   set-mode connected           flip to connected mode
+#   set-mode off-grid            flip to off-grid mode
+#   set-mode --get               print current mode, no flip
+#   set-mode -h | --help         print this help
+#
+# Mutates: rewrites .io.v4rian.how-git/MODE and commits it as
+# "[MODE] switch to <mode>" on the current branch; does not push.
+# Flipping to off-grid needs no GitHub admin (it is local; the remote's
+# rules still guard every push). Flipping to connected refuses unless gh is
+# installed and authenticated, origin is set and the actor is a repo admin,
+# because the remote then runs the claim ceremonies. LIFECYCLE_TEST_MODE=1
+# bypasses the admin gate.
+#
+# Exit codes:
+#   0  mode flipped, already in that mode, --get printed, or help
+#   2  not a git repo, MODE file missing, or an argument other than
+#      connected, off-grid, --get, -h, --help
+#   3  admin gate refused on a flip to connected (gh missing, no origin, gh
+#      not authenticated, or the actor is not admin)
+
+set -euo pipefail
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0; }
+
+for _arg in "$@"; do case "$_arg" in -h|--help) usage ;; esac; done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -z "$REPO_ROOT" ] && { echo "X set-mode: not inside a git repo" >&2; exit 2; }
+
+MODE_FILE="$REPO_ROOT/.io.v4rian.how-git/MODE"
+[ -f "$MODE_FILE" ] || { echo "X set-mode: $MODE_FILE missing - is this a v4rian-bootstrapped repo?" >&2; exit 2; }
+
+CURRENT=$(tr -d '\n' < "$MODE_FILE")
+
+case "${1:-}" in
+  --get)
+    echo "$CURRENT"
+    exit 0
+    ;;
+  -h|--help)
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+    exit 0
+    ;;
+  connected|off-grid)
+    NEW="$1"
+    ;;
+  *)
+    echo "X set-mode: expected 'connected' or 'off-grid' (got '${1:-<empty>}')" >&2
+    echo "  current mode: $CURRENT" >&2
+    exit 2
+    ;;
+esac
+
+# Any mode tool run also installs the hooks-off fallback post-merge, so a
+# merge made later with core.hooksPath unset is still claimed.
+# shellcheck source=../scripts/_lib.sh
+. "$REPO_ROOT/.io.v4rian.how-git/scripts/_lib.sh"
+( cd "$REPO_ROOT" && ensure_merge_hook_fallback )
+
+if [ "$NEW" = "$CURRENT" ]; then
+  echo "-> already in $CURRENT mode; no change"
+  exit 0
+fi
+
+# Admin gate (shared with bin/warp and bin/set-merge-policy).
+NS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR/scripts/_lib.sh"
+# Flipping to off-grid needs no GitHub admin: it only moves the claim
+# ceremonies to this clone, and the remote's own rules still guard every
+# push (a new repo has nothing remote to protect yet). Flipping to
+# connected hands the ceremonies to the remote, so it keeps the admin check
+# (friction ledger FP-06).
+if [ "$NEW" = "off-grid" ]; then
+  echo "-> off-grid flip is local; no GitHub admin needed"
+else
+  require_repo_admin set-mode connected "flip the mode to connected"
+fi
+
+echo "$NEW" > "$MODE_FILE"
+echo "-> MODE updated: $CURRENT -> $NEW"
+
+cd "$REPO_ROOT"
+git add .io.v4rian.how-git/MODE
+git commit -m "[MODE] switch to $NEW" -m "Flips the v4rian repo mode from $CURRENT to $NEW. From this commit on, the $NEW-mode tooling is the only valid path for claim ceremonies; the $CURRENT-mode tooling will refuse to run."
+
+echo "v mode flip committed; push the resulting commit through your normal flow"

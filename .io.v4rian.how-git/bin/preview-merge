@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# preview-merge - predict the outcome of merging a PR into dev WITHOUT
+# actually merging. Useful before accepting a PR in the GitHub UI to
+# know whether the merge is clean, what version it would claim, and
+# which other open PRs would need rebasing afterward.
+#
+# Operates in a disposable worktree; never touches the caller's tree
+# or the actual branches.
+#
+# Usage:
+#   preview-merge <pr-number>      predict the merge outcome
+#   preview-merge -h | --help
+#
+# Preconditions: inside a git repo with an origin remote, gh CLI
+# authenticated. Read-only: the trial merge runs in a disposable detached
+# worktree that is removed on exit; no branch, ref or PR changes.
+#
+# Exit codes:
+#   0  prediction printed (clean or conflicting), or help
+#   2  PR number not a positive integer, not a git repo, gh missing, PR head
+#      unresolvable, or the preview worktree could not be created
+
+set -uo pipefail
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0; }
+
+if [ $# -eq 0 ]; then usage; fi
+case "$1" in
+  -h|--help) usage ;;
+esac
+
+PR_NUM="$1"
+if ! [[ "$PR_NUM" =~ ^[0-9]+$ ]]; then
+  echo "X preview-merge: PR number must be a positive integer (got: $PR_NUM)" >&2
+  exit 2
+fi
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X preview-merge: not inside a git repo" >&2
+  exit 2
+fi
+
+cd "$REPO_ROOT"
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "X preview-merge: gh CLI required" >&2
+  exit 2
+fi
+
+REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
+OWNER_REPO=$(echo "$REMOTE_URL" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+
+# Fetch the PR head branch name (parse JSON ourselves; --jq isn't reliably
+# supported in test mocks)
+HEAD_REF=$(gh pr view "$PR_NUM" --repo "$OWNER_REPO" --json headRefName 2>/dev/null | \
+  python3 -c "import json,sys; print(json.load(sys.stdin).get('headRefName',''))" 2>/dev/null || true)
+if [ -z "$HEAD_REF" ]; then
+  echo "X preview-merge: cannot resolve PR #$PR_NUM head branch (does the PR exist?)" >&2
+  exit 2
+fi
+
+git fetch -q origin "$HEAD_REF:refs/remotes/origin/$HEAD_REF" 2>/dev/null || true
+git fetch -q origin dev 2>/dev/null || true
+
+DEV_TIP=$(git rev-parse origin/dev 2>/dev/null || git rev-parse dev)
+PR_TIP=$(git rev-parse "origin/$HEAD_REF" 2>/dev/null || git rev-parse "$HEAD_REF")
+
+echo "-> previewing merge of PR #$PR_NUM ($HEAD_REF -> dev)"
+echo "   dev tip:  $(git rev-parse --short "$DEV_TIP")"
+echo "   pr tip:   $(git rev-parse --short "$PR_TIP")"
+echo
+
+# Predicted version
+VERSION_BIN="$REPO_ROOT/.io.v4rian.how-git/bin/version"
+if [ -x "$VERSION_BIN" ]; then
+  echo "   predicted dev tag after merge: $($VERSION_BIN --next-dev)"
+fi
+
+# Test the merge in a disposable worktree
+WT=$(mktemp -d -t v4rian-preview-XXXXXX)
+trap 'git worktree remove --force "$WT" 2>/dev/null; rm -rf "$WT"' EXIT
+
+if ! git worktree add -q --detach "$WT" "$DEV_TIP" 2>/dev/null; then
+  echo "X cannot create preview worktree"
+  exit 2
+fi
+
+pushd "$WT" >/dev/null
+git checkout -q -B __preview "$DEV_TIP"
+if git -c user.email=preview@local -c user.name=preview merge --no-ff --no-commit "$PR_TIP" 2>/dev/null; then
+  echo "   merge:    CLEAN (no conflicts)"
+  # Get the file diff stat
+  git merge --abort 2>/dev/null || git reset --hard "$DEV_TIP" >/dev/null 2>&1
+  git diff --stat "$DEV_TIP" "$PR_TIP" | tail -1 | sed 's/^/   /'
+else
+  echo "   merge:    CONFLICTS"
+  CONFLICTS=$(git diff --name-only --diff-filter=U)
+  echo "$CONFLICTS" | while IFS= read -r f; do
+    [ -n "$f" ] && echo "     - $f"
+  done
+  git merge --abort 2>/dev/null
+  echo
+  echo "   on real merge, the auto-rebase + reconcile flow would fire (L1-L5 ladder)."
+fi
+popd >/dev/null

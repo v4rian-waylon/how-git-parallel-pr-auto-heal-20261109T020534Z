@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# queue - show the current PR queue with dependencies and conflict predictions.
+#
+# For each open PR targeting dev, prints:
+#   #N  pool/...  CONFLICTS_WITH: <list of other PR numbers that touch overlapping files>
+#
+# Helps a maintainer pick the merge order that minimizes reconciles.
+# Uses gh CLI for PR enumeration and git diff for file-overlap analysis.
+#
+# Usage:
+#   queue                 default human-readable table
+#   queue --json          machine-readable JSON
+#   queue --pair N M      predict conflict between PR N and PR M only
+#   queue -h | --help
+#
+# Preconditions: inside a git repo with an origin remote, gh CLI
+# authenticated. Read-only apart from a git fetch of origin dev.
+#
+# Exit codes:
+#   0  queue printed (including "no open PRs targeting dev"), or help
+#   2  not a git repo, unknown flag, gh missing, owner/repo not derivable
+#      from origin, or no dev tip found
+
+set -uo pipefail
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0; }
+
+for _arg in "$@"; do case "$_arg" in -h|--help) usage ;; esac; done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X queue: not inside a git repo" >&2
+  exit 2
+fi
+
+MODE=table
+PAIR_A=""
+PAIR_B=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) MODE=json; shift ;;
+    --pair) MODE=pair; PAIR_A="$2"; PAIR_B="$3"; shift 3 ;;
+    -h|--help) usage ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+cd "$REPO_ROOT"
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "X gh CLI required" >&2
+  exit 2
+fi
+
+REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
+OWNER_REPO=$(echo "$REMOTE_URL" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+if [ -z "$OWNER_REPO" ]; then
+  echo "X cannot derive owner/repo from origin" >&2
+  exit 2
+fi
+
+# Fetch all open PRs
+PRS_JSON=$(gh pr list --repo "$OWNER_REPO" --state open --base dev --json number,title,headRefName --limit 100 2>/dev/null || echo "[]")
+if [ "$PRS_JSON" = "[]" ] || [ -z "$PRS_JSON" ]; then
+  if [ "$MODE" = json ]; then
+    echo '[]'
+  else
+    echo "no open PRs targeting dev"
+  fi
+  exit 0
+fi
+
+# Determine dev tip (the reference point for file-diff)
+git fetch -q origin dev 2>/dev/null || true
+DEV_TIP=$(git rev-parse origin/dev 2>/dev/null || git rev-parse dev 2>/dev/null || echo "")
+
+if [ -z "$DEV_TIP" ]; then
+  echo "X cannot find dev tip" >&2
+  exit 2
+fi
+
+# For each PR, compute the list of files it modifies (diff vs dev tip)
+# Store in a tmp index: PR_NUM -> space-separated file list
+INDEX_FILE=$(mktemp -t v4rian-queue-XXXXXX)
+trap 'rm -f "$INDEX_FILE"' EXIT
+
+echo "$PRS_JSON" | python3 -c 'import json,sys
+for pr in json.load(sys.stdin):
+    n=pr["number"]; h=pr["headRefName"]; t=pr["title"]
+    print("%s\t%s\t%s" % (n, h, t))' \
+  | while IFS=$'\t' read -r NUM HEAD TITLE; do
+      git fetch -q origin "$HEAD:refs/remotes/origin/$HEAD" 2>/dev/null || true
+      FILES=$(git diff --name-only "$DEV_TIP...origin/$HEAD" 2>/dev/null | tr '\n' '|')
+      echo "${NUM}|${HEAD}|${TITLE}|${FILES}" >> "$INDEX_FILE"
+    done
+
+# Compute file-overlap pairs
+build_conflict_map() {
+  python3 - <<PY
+import sys
+prs = []
+with open("$INDEX_FILE") as f:
+    for line in f:
+        parts = line.rstrip("\n").split("|", 3)
+        if len(parts) < 4: continue
+        num, head, title, files = parts
+        prs.append({"num": int(num), "head": head, "title": title, "files": set(files.split("|")) - {""}})
+conflicts = {p["num"]: [] for p in prs}
+for i, a in enumerate(prs):
+    for b in prs[i+1:]:
+        if a["files"] & b["files"]:
+            conflicts[a["num"]].append(b["num"])
+            conflicts[b["num"]].append(a["num"])
+import json
+print(json.dumps([{"num": p["num"], "head": p["head"], "title": p["title"], "conflicts_with": sorted(conflicts[p["num"]])} for p in prs], indent=2))
+PY
+}
+
+CONFLICT_JSON=$(build_conflict_map)
+
+if [ "$MODE" = pair ]; then
+  echo "$CONFLICT_JSON" | python3 -c "
+import json, sys
+prs = json.load(sys.stdin)
+a, b = $PAIR_A, $PAIR_B
+pa = next((p for p in prs if p['num'] == a), None)
+pb = next((p for p in prs if p['num'] == b), None)
+if not pa or not pb:
+    print(f'X one or both PRs not in open queue (#{a}, #{b})')
+    sys.exit(1)
+if b in pa['conflicts_with']:
+    print(f'CONFLICT: #{a} and #{b} touch overlapping files')
+else:
+    print(f'OK: #{a} and #{b} have no file overlap')
+"
+elif [ "$MODE" = json ]; then
+  echo "$CONFLICT_JSON"
+else
+  echo "$CONFLICT_JSON" | python3 -c "
+import json, sys
+prs = json.load(sys.stdin)
+print(f'{len(prs)} open PR(s) targeting dev')
+print()
+for p in sorted(prs, key=lambda x: x['num']):
+    confs = ', '.join(f'#{n}' for n in p['conflicts_with']) if p['conflicts_with'] else '(none)'
+    print(f'  #{p[\"num\"]:>3}  {p[\"head\"]}')
+    print(f'        conflicts with: {confs}')
+    print()
+"
+fi

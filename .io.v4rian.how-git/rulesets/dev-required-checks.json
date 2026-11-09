@@ -1,0 +1,43 @@
+{
+  "_comment": "v4rian dev required status checks, required for any PR merge to dev. The required.* contexts (required.commit-audit, required.compile, required.coverage, required.runtime, required.offline-test-suites) are emitted by .github/workflows/ci-dispatch.yml on the PUSH trigger and match the required.*.sh basenames (minus .sh) under .io.v4rian.how-git/ci/{tests,audits}/push/ - they run when commits are pushed to a pool branch; the PR itself does not re-run them but REUSES the push results by head SHA (GitHub attaches the existing commit statuses to the PR). The 'reconcile' context is NOT a required.*.sh file: it is seeded by .io.v4rian.how-git/scripts/validate-pr-open.sh and resolved per outcome by .io.v4rian.how-git/scripts/auto-rebase-pools-after-dev-merge.sh. Applied via .io.v4rian.how-git/scripts/apply-repo-rules.sh, which folds these contexts into the dev branch protection rule. The check names MUST match the matrix job 'name:' fields in ci-dispatch.yml verbatim; GitHub matches required checks by exact string.",
+  "name": "v4rian-dev-required-checks",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/heads/dev"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [
+          {
+            "context": "required.commit-audit"
+          },
+          {
+            "context": "required.compile"
+          },
+          {
+            "context": "required.coverage"
+          },
+          {
+            "context": "required.runtime"
+          },
+          {
+            "context": "required.offline-test-suites"
+          },
+          {
+            "context": "reconcile"
+          }
+        ]
+      }
+    }
+  ],
+  "bypass_actors": []
+}

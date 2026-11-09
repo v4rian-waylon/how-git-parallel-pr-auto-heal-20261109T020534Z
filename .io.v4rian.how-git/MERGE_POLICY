@@ -1,0 +1,31 @@
+# Merge policy for pool/* -> dev. Committed with the repo, one key=value per
+# line. Change it with bin/set-merge-policy (admin-gated, logs a [MODE]
+# commit). Read by bin/finalize-pool-merge (off-grid), bin/init-pool-merge
+# (connected) and the pre-push hook. dev -> main rules are never affected.
+#
+# dev_merge_who       anyone | admins | list
+#                     Who may merge a pool into dev. admins = emails listed
+#                     in admins.txt (no admins.txt = permissive first run);
+#                     list = emails in dev_merge_list.
+# dev_merge_list      Comma-separated emails, used when dev_merge_who=list.
+# dev_merge_pr        required | optional
+#                     required: in connected mode a pool reaches dev only
+#                     through a PR; pre-push refuses a local merge push to dev.
+# dev_merge_approval  none | required
+#                     required: the pool -> dev merge commit carries an
+#                     "Approved-by: <email>" trailer naming an allowed merger
+#                     other than the operator.
+# dev_merge_gates     Comma-separated ci-local check names (push trigger) that
+#                     must pass before the close-up, e.g. required.compile.
+# dev_merge_max_commits Most non-merge commits one pool may bring into dev
+#                     (default 20, 0 = no cap). Bigger deliveries land as
+#                     sequential pools. Never lifted by warp.
+#
+# bin/warp on lifts who, pr and approval for pool -> dev only; gates and the
+# commit cap still run.
+dev_merge_who=admins
+dev_merge_list=
+dev_merge_pr=required
+dev_merge_approval=none
+dev_merge_gates=
+dev_merge_max_commits=20

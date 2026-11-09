@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+# create-pool-branch - local CLI wrapper around the allocator script.
+#
+# In connected mode, dispatches .github/workflows/allocate-pool-branch.yml
+# via `gh workflow run` so the canonical
+# .io.v4rian.how-git/scripts/allocate-pool-branch.sh runs server-side
+# against the GITHUB_TOKEN identity that the repository rulesets are
+# pinned to. No mutation happens locally.
+#
+# In off-grid mode, invokes the same canonical allocator script LOCALLY
+# (ALLOC_MODE=off-grid) so the script creates the pool+safety pair as
+# local refs in the working copy. No GitHub workflow is dispatched. The
+# off-grid invariant is that the operator workflow replicates connected
+# mode exactly; only the under-the-hood implementation differs. Off-grid
+# allocation fetches the tracked remote first, refuses shallow and
+# single-branch clones, and never reissues a spent number (see
+# scripts/allocate-pool-branch.sh --help for the counter sources).
+#
+# Configuration:
+#
+#   --repo OWNER/REPO   Override the target repo. Defaults to the
+#                       origin remote of the current working copy when
+#                       inside a git repo. Ignored in off-grid mode.
+#   --token VAL         Override the GitHub token. Defaults to the
+#                       chain GH_TOKEN -> CREATE_POOL_BRANCH_TOKEN ->
+#                       `gh auth token`. Ignored in off-grid mode.
+#   --no-jira           Allocate without a JIRA key - branch name omits
+#                       the JIRA segment, idempotency-by-JIRA is skipped.
+#                       Works in both connected and off-grid modes.
+#                       In connected mode the workflow's admin gate is
+#                       the authorization (repo admins only).
+#
+# Advisory admin check (connected only): queries the current logged-in
+# user's permission on the target repo via `gh api` and refuses to
+# dispatch when the role is not admin. Determined bypass is possible
+# by invoking gh directly; the workflow itself re-runs the same check
+# server-side and the repository rulesets are the final authority.
+# Off-grid mode skips the advisory check; the admin gate there is the
+# local finalize-pool-merge admins.txt check at close-up time.
+#
+# Usage:
+#   create-pool-branch <short_name> --jira KEY-NNN [--kind KIND] [--sprint N]
+#                                   [--requirement TEXT | --requirement-file PATH]
+#                                   [--dry-run] [--json] [--no-wait]
+#   create-pool-branch <short_name> --no-jira       [--kind KIND] [--sprint N]
+#                                   [--requirement TEXT | --requirement-file PATH]
+#                                   [--dry-run] [--json] [--no-wait]    # admin in connected; anyone in off-grid
+#
+# Connected mode waits for the allocator run and prints the pair it made,
+# the same result (and with --json the same JSON, plus run_url) as
+# off-grid; --no-wait returns once the run is dispatched. Progress goes to
+# stderr, so --json leaves stdout a single JSON document.
+#
+# Examples:
+#   create-pool-branch parser-rewrite --jira PROJ-123 --kind feature
+#   create-pool-branch token-leak --jira SEC-9 --kind fix --sprint 4
+#   create-pool-branch embedding-cache --jira RND-42 --sprint 5 --dry-run
+#   create-pool-branch parser-rewrite --jira PROJ-123 --requirement-file ./req.txt
+#   create-pool-branch parser-rewrite --jira PROJ-123 --requirement "Rewrite the parser to handle nested blocks."
+#   create-pool-branch local-only --no-jira --kind feature              # off-grid OR connected-admin
+#
+# When --requirement (or --requirement-file) is supplied, the allocator
+# stamps the text into the lane's requirements/ file plus the body of the
+# initial [REQ] commit on the pool branch. Auditors and the smart-commit
+# tool fetch the text via .io.v4rian.how-git/scripts/get-active-requirement.sh
+# when invoking claude.
+#
+# Exit codes:
+#   0  allocated, dispatched with --no-wait (connected), or --dry-run / --help
+#   1  the off-grid allocator script failed (its output is printed)
+#   2  usage error: missing short_name, bad or missing --jira, --jira with
+#      --no-jira, bad --kind or --sprint, missing --requirement-file, or no
+#      origin remote to derive --repo from
+#   3  missing prerequisite: allocator script, gh CLI, or a GitHub token
+#   4  refused: the gh user is not a repo admin (advisory; the workflow
+#      re-checks server-side and the rulesets are the final authority)
+#   5  self-bootstrap failed: default branch unresolved, workflow file
+#      missing, or seeding the workflow onto the default branch failed
+#   6  gh workflow run failed; nothing was dispatched
+#   7  dispatch accepted but no run appeared within the poll window
+#   8  the allocator run failed, or its log carried no allocation result
+
+set -euo pipefail
+
+# --help never needs the positional short_name and never reaches the JIRA
+# or mode checks below.
+for _arg in "$@"; do
+  case "$_arg" in -h|--help) sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+done
+
+# Source the shared library so the mode accessor (get_mode) is available
+# without re-implementing the MODE file read here. The library is sourced
+# (not executed) so no side effects fire.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+ALLOC_SCRIPT="$NS_DIR/scripts/allocate-pool-branch.sh"
+# Derive the framework repo root from the script's own location so
+# `create-pool-branch` works from any CWD inside the repo (or from outside
+# when invoked by absolute path).
+REPO_ROOT=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || dirname "$NS_DIR")
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR/scripts/_lib.sh"
+
+# --- Defaults ---
+REPO=""
+TOKEN="${GH_TOKEN:-${CREATE_POOL_BRANCH_TOKEN:-}}"
+KIND=""
+SHORT=""
+JIRA=""
+SPRINT=""
+REQUIREMENT=""
+REQUIREMENT_FILE=""
+JSON_OUT=false
+DRY_RUN=false
+NO_JIRA=false
+NO_WAIT=false
+
+usage() {
+  sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# --- Parse positional args ---
+if [ $# -lt 1 ]; then
+  usage 2
+fi
+
+SHORT="$1"; shift
+
+# --- Parse flags ---
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kind)              KIND="$2"; shift 2 ;;
+    --jira)              JIRA="$2"; shift 2 ;;
+    --sprint)            SPRINT="$2"; shift 2 ;;
+    --requirement)       REQUIREMENT="$2"; shift 2 ;;
+    --requirement-file)  REQUIREMENT_FILE="$2"; shift 2 ;;
+    --repo)              REPO="$2"; shift 2 ;;
+    --token)             TOKEN="$2"; shift 2 ;;
+    --no-jira)           NO_JIRA=true; shift ;;
+    --json)              JSON_OUT=true; shift ;;
+    --no-wait)           NO_WAIT=true; shift ;;
+    --dry-run)           DRY_RUN=true; shift ;;
+    -h|--help)           usage 0 ;;
+    *) echo "create-pool-branch: unknown flag: $1" >&2; usage 2 ;;
+  esac
+done
+
+# --requirement-file overrides --requirement (matches allocator semantics).
+if [ -n "$REQUIREMENT_FILE" ]; then
+  if [ ! -f "$REQUIREMENT_FILE" ]; then
+    echo "create-pool-branch: requirement file '$REQUIREMENT_FILE' does not exist" >&2
+    exit 2
+  fi
+  REQUIREMENT=$(cat "$REQUIREMENT_FILE")
+fi
+
+# --- Resolve mode (used for validation gating below) ---
+MODE_VAL=$(get_mode 2>/dev/null || echo "connected")
+
+# --- Validate ---
+# JIRA is OPTIONAL - when supplied the allocator stamps it into the
+# branch name and uses it as the idempotency token; when omitted the
+# branch name omits the JIRA segment and idempotency-by-JIRA is skipped.
+# Both modes (connected + off-grid) accept --no-jira. In connected mode
+# the workflow's admin gate is the authorization (only repo admins can
+# dispatch); the advisory admin_check() below also runs locally.
+if $NO_JIRA; then
+  if [ -n "$JIRA" ]; then
+    echo "create-pool-branch: --no-jira and --jira are mutually exclusive" >&2
+    exit 2
+  fi
+else
+  if [ -z "$JIRA" ]; then
+    echo "create-pool-branch: --jira KEY-NNN is required (or pass --no-jira to omit the JIRA segment)" >&2
+    exit 2
+  fi
+  if ! [[ "$JIRA" =~ ^[A-Z]+-[0-9]+$ ]]; then
+    echo "create-pool-branch: --jira must match PROJ-NNN" >&2
+    exit 2
+  fi
+fi
+if [ -n "$KIND" ]; then
+  # The kind set is the shared HG_BRANCH_KINDS (scripts/_lib.sh).
+  if ! [[ "$KIND" =~ ^(${HG_BRANCH_KINDS})$ ]]; then
+    echo "create-pool-branch: invalid --kind '$KIND' (must be one of: $HG_BRANCH_KINDS)" >&2
+    exit 2
+  fi
+fi
+if [ -n "$SPRINT" ] && ! [[ "$SPRINT" =~ ^[0-9]+$ ]]; then
+  echo "create-pool-branch: --sprint must be a positive integer" >&2
+  exit 2
+fi
+if [ -z "$SHORT" ]; then
+  echo "create-pool-branch: short_name is required" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Off-grid path: invoke the canonical allocator script locally with
+# ALLOC_MODE=off-grid. No origin resolution, no token, no gh CLI, no
+# workflow dispatch. The allocator creates the pool+safety pair as local
+# refs via the same code path that the connected workflow runs against
+# the Git Data API.
+# ---------------------------------------------------------------------------
+if [ "$MODE_VAL" = "off-grid" ]; then
+  if [ ! -x "$ALLOC_SCRIPT" ]; then
+    echo "create-pool-branch: allocator script missing or not executable at $ALLOC_SCRIPT" >&2
+    exit 3
+  fi
+
+  ALLOC_ARGS=(--mode off-grid --short-name "$SHORT")
+  if $NO_JIRA; then
+    ALLOC_ARGS+=(--no-jira)
+  else
+    ALLOC_ARGS+=(--jira "$JIRA")
+  fi
+  [ -n "$KIND" ]              && ALLOC_ARGS+=(--kind "$KIND")
+  [ -n "$SPRINT" ]             && ALLOC_ARGS+=(--sprint "$SPRINT")
+  [ -n "$REQUIREMENT" ]        && ALLOC_ARGS+=(--requirement "$REQUIREMENT")
+  [ -n "$REQUIREMENT_FILE" ]   && ALLOC_ARGS+=(--requirement-file "$REQUIREMENT_FILE")
+
+  if $DRY_RUN; then
+    echo "[dry-run] mode: off-grid" >&2
+    echo "[dry-run] inputs: kind='${KIND:-<classify>}' short_name='$SHORT' jira_key='${JIRA:-<none>}' sprint='${SPRINT:-<none>}' requirement=${REQUIREMENT:+<supplied: ${#REQUIREMENT} chars>}${REQUIREMENT:-<none>}" >&2
+    echo "[dry-run] would call: bash $ALLOC_SCRIPT ${ALLOC_ARGS[*]:-}" >&2
+    exit 0
+  fi
+
+  if $JSON_OUT; then
+    bash "$ALLOC_SCRIPT" ${ALLOC_ARGS[@]+"${ALLOC_ARGS[@]}"}
+  else
+    OUT=$(bash "$ALLOC_SCRIPT" ${ALLOC_ARGS[@]+"${ALLOC_ARGS[@]}"}) || { echo "$OUT"; exit 1; }
+    printf '%s\n' "$OUT"
+    BRANCH=$(printf '%s' "$OUT" | grep -oE '"branch_name":[[:space:]]*"[^"]+"' | head -1 | sed -E 's|.*"branch_name":[[:space:]]*"([^"]+)".*|\1|')
+    [ -n "$BRANCH" ] && echo "✓ pool+safety pair allocated locally: $BRANCH"
+    echo "  (off-grid mode; no workflow dispatched, no remote push)"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Connected path: dispatch the allocator workflow on the target repo so
+# the canonical script runs server-side against the GITHUB_TOKEN identity
+# that the repository rulesets are pinned to.
+# ---------------------------------------------------------------------------
+
+# --- Resolve repo from the framework repo's origin when not supplied ---
+# Read from REPO_ROOT (derived from this script's own location) so the
+# resolution is CWD-independent. The user can invoke create-pool-branch
+# from any working directory and origin still resolves correctly.
+if [ -z "$REPO" ]; then
+  REMOTE_URL=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)
+  if [ -z "$REMOTE_URL" ]; then
+    echo "create-pool-branch: --repo not supplied and the framework repo at $REPO_ROOT has no origin remote configured" >&2
+    exit 2
+  fi
+  REPO=$(echo "$REMOTE_URL" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+fi
+
+# --- gh CLI required ---
+if ! command -v gh >/dev/null 2>&1; then
+  echo "create-pool-branch: gh CLI is required (install: brew install gh)" >&2
+  exit 3
+fi
+
+# --- Token resolution (gh's own auth chain as fallback) ---
+if [ -z "$TOKEN" ]; then
+  TOKEN=$(gh auth token 2>/dev/null || true)
+fi
+if [ -z "$TOKEN" ]; then
+  echo "create-pool-branch: no GitHub token available (set GH_TOKEN, CREATE_POOL_BRANCH_TOKEN, or run 'gh auth login')" >&2
+  exit 3
+fi
+
+# --- Advisory admin permission check ---
+admin_check() {
+  local actor perm
+  actor=$(GH_TOKEN="$TOKEN" gh api user --jq '.login' 2>/dev/null || true)
+  if [ -z "$actor" ]; then
+    echo "create-pool-branch: failed to resolve actor login (advisory check skipped)" >&2
+    return 0
+  fi
+  perm=$(GH_TOKEN="$TOKEN" gh api "repos/$REPO/collaborators/$actor/permission" --jq '.permission' 2>/dev/null || echo "unknown")
+  if [ "$perm" != "admin" ]; then
+    echo "✗ refusing to dispatch: actor '$actor' has permission '$perm' on $REPO (admin required)" >&2
+    echo "  (advisory local guard; the workflow re-checks server side and rulesets are the final authority)" >&2
+    return 1
+  fi
+  echo "  ✓ actor=$actor permission=admin on $REPO" >&2
+  return 0
+}
+
+if $DRY_RUN; then
+  echo "[dry-run] target repo: $REPO" >&2
+  if $NO_JIRA; then
+    echo "[dry-run] inputs: kind='${KIND:-<classify>}' short_name='$SHORT' no_jira=true sprint='${SPRINT:-<none>}' requirement=${REQUIREMENT:+<supplied: ${#REQUIREMENT} chars>}${REQUIREMENT:-<none>}" >&2
+  else
+    echo "[dry-run] inputs: kind='${KIND:-<classify>}' short_name='$SHORT' jira_key='$JIRA' sprint='${SPRINT:-<none>}' requirement=${REQUIREMENT:+<supplied: ${#REQUIREMENT} chars>}${REQUIREMENT:-<none>}" >&2
+  fi
+  admin_check || true
+  echo "[dry-run] would call: gh workflow run allocate-pool-branch.yml -R $REPO -f short_name=... [-f kind=...] [-f jira_key=... | -f no_jira=true] [-f sprint=...] [-f requirement=...]" >&2
+  exit 0
+fi
+
+admin_check || exit 4
+
+# --- Without the CI bot App, the admin allocates from here ---
+# The workflow can create pool and safety refs past the rulesets only with
+# the App's token. Without the App, the operator (an admin, checked above)
+# runs the canonical allocator locally in connected mode: the refs are
+# created through the Git Data API under the operator's own token, which
+# never leaves this machine.
+if [ -z "$(GH_TOKEN="$TOKEN" gh variable get CI_BOT_APP_ID -R "$REPO" 2>/dev/null || true)" ]; then
+  LOCAL_ARGS=(--mode connected --short-name "$SHORT")
+  if $NO_JIRA; then LOCAL_ARGS+=(--no-jira); else LOCAL_ARGS+=(--jira "$JIRA"); fi
+  [ -n "$KIND" ]             && LOCAL_ARGS+=(--kind "$KIND")
+  [ -n "$SPRINT" ]           && LOCAL_ARGS+=(--sprint "$SPRINT")
+  [ -n "$REQUIREMENT" ]      && LOCAL_ARGS+=(--requirement "$REQUIREMENT")
+  [ -n "$REQUIREMENT_FILE" ] && LOCAL_ARGS+=(--requirement-file "$REQUIREMENT_FILE")
+  echo "-> no CI bot App on $REPO: allocating locally as admin (connected mode)" >&2
+  if ! LOCAL_OUT=$(GITHUB_REPOSITORY="$REPO" GH_TOKEN="$TOKEN" ALLOC_PUSH_TOKEN="$TOKEN" \
+        bash "$ALLOC_SCRIPT" ${LOCAL_ARGS[@]+"${LOCAL_ARGS[@]}"}); then
+    printf '%s\n' "$LOCAL_OUT" >&2
+    echo "X create-pool-branch: local allocation failed" >&2
+    exit 1
+  fi
+  LOCAL_JSON=$(printf '%s' "$LOCAL_OUT" | python3 -c '
+import json, sys
+lines = sys.stdin.read().split("\n")
+for i, l in enumerate(lines):
+    if l.strip() != "{": continue
+    for j in range(i + 1, len(lines)):
+        if lines[j].strip() == "}":
+            try: d = json.loads("\n".join(lines[i:j + 1]))
+            except ValueError: break
+            if d.get("branch_name"): print(json.dumps(d, indent=2)); sys.exit(0)
+            break
+sys.exit(1)') || { printf '%s\n' "$LOCAL_OUT" >&2; echo "X create-pool-branch: the allocator printed no allocation" >&2; exit 1; }
+  if $JSON_OUT; then
+    printf '%s\n' "$LOCAL_JSON"
+  else
+    echo "✓ pool+safety pair allocated on $REPO: $(printf '%s' "$LOCAL_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["branch_name"])')"
+  fi
+  exit 0
+fi
+
+# --- Self-bootstrap: seed allocate-pool-branch.yml onto the default
+# branch if it has never fired (GH Actions only registers workflows on
+# the default branch or once a trigger has fired). This is the per-tool
+# first-run registration step: bootstrap-ci owns repo CI; the allocator
+# tool owns its own workflow's registration. Idempotent: the file
+# probe is a Contents API HEAD-equivalent that costs one API call when
+# the file already exists. ---
+WF_NAME="allocate-pool-branch.yml"
+WF_REGISTERED_RC=$(GH_TOKEN="$TOKEN" gh api "/repos/$REPO/actions/workflows/$WF_NAME" -i 2>/dev/null | sed -n 1p | awk '{print $2}')
+if [ "$WF_REGISTERED_RC" != "200" ]; then
+  echo "→ allocator workflow not registered yet on $REPO (HTTP $WF_REGISTERED_RC); seeding $WF_NAME onto the default branch" >&2
+  DEFAULT_BRANCH=$(GH_TOKEN="$TOKEN" gh api "/repos/$REPO" --jq '.default_branch' 2>/dev/null || true)
+  if [ -z "$DEFAULT_BRANCH" ]; then
+    echo "create-pool-branch: could not resolve default branch from /repos/$REPO; cannot self-bootstrap" >&2
+    exit 5
+  fi
+  DEFAULT_HAS=$(curl -sS -o /dev/null -w "%{http_code}" \
+    -H "Authorization: token $TOKEN" \
+    "https://api.github.com/repos/$REPO/contents/.github/workflows/$WF_NAME?ref=$DEFAULT_BRANCH" 2>/dev/null || echo 000)
+  if [ "$DEFAULT_HAS" != "200" ]; then
+    WF_FILE="$REPO_ROOT/.github/workflows/$WF_NAME"
+    if [ ! -f "$WF_FILE" ]; then
+      echo "create-pool-branch: workflow file missing at $WF_FILE; cannot self-bootstrap" >&2
+      exit 5
+    fi
+    WF_B64=$(base64 < "$WF_FILE" | tr -d '\n')
+    SEED_BODY=$(python3 -c "
+import json
+print(json.dumps({
+  'message': 'create-pool-branch: seed allocate-pool-branch.yml to default for workflow registration',
+  'content': '$WF_B64',
+  'branch': '$DEFAULT_BRANCH',
+}))")
+    SEED_RESP=$(curl -sS -X PUT \
+      -H "Authorization: token $TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/$REPO/contents/.github/workflows/$WF_NAME" \
+      -d "$SEED_BODY" 2>/dev/null || echo "")
+    if ! echo "$SEED_RESP" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+sys.exit(0 if d.get('commit',{}).get('sha') else 1)" 2>/dev/null; then
+      echo "create-pool-branch: seed of $WF_NAME onto $DEFAULT_BRANCH failed; response:" >&2
+      echo "  $SEED_RESP" >&2
+      exit 5
+    fi
+    echo "✓ seeded $WF_NAME onto $DEFAULT_BRANCH (workflow now registered with GitHub Actions)" >&2
+  else
+    echo "  ($WF_NAME already on $DEFAULT_BRANCH; GH Actions registry should pick it up on next API access)" >&2
+  fi
+fi
+
+# --- Dispatch the allocator workflow ---
+# The workflow is the canonical creation path per the v4rian design: it
+# runs on GitHub Actions under the GITHUB_TOKEN identity that the
+# repository rulesets pin pool/* and safety/* ref creation to. Local
+# direct invocation would require admin-bypass on the rulesets which is
+# explicitly out of design (per feedback_no_developer_branch_creation).
+# Dispatch against the dev branch: the allocator workflow and script live on
+# dev, and main is intentionally minimal (populated only by releases), so it
+# carries neither the workflow file nor the workflow_dispatch trigger. Omitting
+# --ref makes gh target the default branch (main) and GitHub answers HTTP 422
+# "Workflow does not have workflow_dispatch trigger". ALLOCATOR_REF overrides
+# the branch for non-standard layouts.
+ARGS=(-R "$REPO" --ref "${ALLOCATOR_REF:-dev}" -f "short_name=$SHORT")
+if $NO_JIRA; then
+  ARGS+=(-f "no_jira=true")
+else
+  ARGS+=(-f "jira_key=$JIRA")
+fi
+[ -n "$KIND" ]        && ARGS+=(-f "kind=$KIND")
+[ -n "$SPRINT" ]      && ARGS+=(-f "sprint=$SPRINT")
+[ -n "$REQUIREMENT" ] && ARGS+=(-f "requirement=$REQUIREMENT")
+# No token travels as an input (docs/ci-trust-model.md): the workflow
+# creates the refs with the CI bot App token from the v4rian-trusted
+# environment; without the App this tool allocates locally (above).
+
+echo "-> dispatching allocate-pool-branch.yml on $REPO ref=${ALLOCATOR_REF:-dev} (short_name=$SHORT)" >&2
+if ! DISPATCH_OUT=$(GH_TOKEN="$TOKEN" gh_workflow_dispatch allocate-pool-branch.yml ${ARGS[@]+"${ARGS[@]}"}); then
+  echo "X create-pool-branch: gh workflow run failed (see above); nothing dispatched" >&2
+  exit 6
+fi
+[ -z "$DISPATCH_OUT" ] || printf '%s\n' "$DISPATCH_OUT" >&2
+
+# The run this dispatch started. gh prints its URL; picking "the latest run"
+# instead could hand a parallel allocation's run to this one. Older gh
+# versions print no URL, so the newest workflow_dispatch run created after
+# the dispatch is the fallback.
+RUN_ID=$(printf '%s' "$DISPATCH_OUT" | grep -oE '/actions/runs/[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)
+if [ -z "$RUN_ID" ]; then
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    RUN_ID=$(GH_TOKEN="$TOKEN" gh run list -R "$REPO" --workflow=allocate-pool-branch.yml \
+        --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null || true)
+    [ -n "$RUN_ID" ] && break
+  done
+fi
+if [ -z "$RUN_ID" ]; then
+  # never stamp a checkmark on an unverified dispatch - a wrapper that ends
+  # quietly without a run id is exactly how a dead allocation hides
+  echo "! dispatch accepted but NO run materialized within the poll window on $REPO" >&2
+  echo "  verify in the Actions tab; if absent, re-run with GH_DEBUG=api for the failure" >&2
+  exit 7
+fi
+RUN_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+
+if $NO_WAIT; then
+  if $JSON_OUT; then
+    printf '{"status":"dispatched","run_id":%s,"run_url":"%s"}\n' "$RUN_ID" "$RUN_URL"
+  else
+    echo "✓ allocator workflow dispatched on $REPO"
+    echo "  watch: $RUN_URL"
+  fi
+  exit 0
+fi
+
+# Wait for the allocation like off-grid does, then report the pair the run
+# created: the allocator prints its result JSON in the run log.
+echo "-> waiting for $RUN_URL" >&2
+if ! GH_TOKEN="$TOKEN" gh run watch "$RUN_ID" -R "$REPO" --exit-status --interval 3 >/dev/null 2>&1; then
+  echo "X create-pool-branch: the allocator run failed: $RUN_URL" >&2
+  exit 8
+fi
+ALLOC_JSON=$(GH_TOKEN="$TOKEN" gh run view "$RUN_ID" -R "$REPO" --log 2>/dev/null | python3 -c '
+import json, re, sys
+lines = [re.sub(r"^[^\t]*\t[^\t]*\t\S+ ?", "", l.rstrip("\n")) for l in sys.stdin]
+for i, l in enumerate(lines):
+    if l.strip() != "{":
+        continue
+    for j in range(i + 1, len(lines)):
+        if lines[j].strip() == "}":
+            try:
+                d = json.loads("\n".join(lines[i:j + 1]))
+            except ValueError:
+                break
+            if d.get("branch_name") and d.get("safety_name"):
+                d["run_url"] = sys.argv[1]
+                print(json.dumps(d, indent=2))
+                sys.exit(0)
+            break
+sys.exit(1)
+' "$RUN_URL") || {
+  echo "X create-pool-branch: the allocator run $RUN_URL succeeded but its log carries no branch_name" >&2
+  exit 8
+}
+if $JSON_OUT; then
+  printf '%s\n' "$ALLOC_JSON"
+else
+  BRANCH=$(printf '%s' "$ALLOC_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["branch_name"])')
+  echo "✓ pool+safety pair allocated on $REPO: $BRANCH"
+  echo "  run: $RUN_URL"
+fi

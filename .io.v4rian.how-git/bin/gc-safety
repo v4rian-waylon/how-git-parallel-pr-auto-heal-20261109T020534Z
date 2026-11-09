@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# gc-safety - garbage-collect released safety snapshots into a trash bundle.
+#
+# Two kinds of refs live under safety/:
+#   Pattern-1  allocator anchors safety/[vYYYY.X/]nN.<kind>.<slug>. They are
+#              the record of where every pool started and stay forever;
+#              this tool never touches them.
+#   Pattern-2  hand-taken snapshots safety/<branch>-<timestamp>, for
+#              example safety/pool/v2026.0/n7.fix.x-20261029-120000.
+#
+# A Pattern-2 snapshot is released when its tip is merged into dev (local
+# dev or origin/dev) AND its pool is vaulted (a vault/<suffix> or
+# vault/<major>/<suffix> ref exists locally or on origin). Only released
+# snapshots are collected; anything else is kept.
+#
+# --apply writes every released ref into one bundle at
+# ~/.Trash/git-branch-trash/<repo>-<YYYY-MM-DD>.bundle, verifies the bundle
+# and checks that it lists each ref at its exact SHA, and only then deletes
+# the local refs (guarded by their old SHA). No verified bundle, no delete.
+# Remote safety refs are never touched.
+#
+# Usage:
+#   gc-safety              dry run: list what would be bundled and deleted
+#   gc-safety --apply      bundle, verify, delete
+#   gc-safety -h|--help    print this help
+#
+# Exit codes:
+#   0  dry run listed, nothing to collect, refs bundled and deleted, or help
+#   1  bundle not written, not verified or missing a ref; no ref deleted
+#   2  unknown flag, not a git repo, or no dev / origin/dev ref
+
+set -euo pipefail
+
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+APPLY=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "X gc-safety: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -n "$REPO_ROOT" ] || { echo "X gc-safety: not inside a git repo" >&2; exit 2; }
+cd "$REPO_ROOT"
+COMMON_DIR=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
+case "$COMMON_DIR" in
+  */.git) REPO_NAME=$(basename "$(dirname "$COMMON_DIR")") ;;
+  *)      REPO_NAME=$(basename "$COMMON_DIR" .git) ;;
+esac
+
+DEV_REFS=""
+for r in refs/heads/dev refs/remotes/origin/dev; do
+  git show-ref -q --verify "$r" && DEV_REFS="$DEV_REFS $r"
+done
+if [ -z "$DEV_REFS" ]; then
+  echo "X gc-safety: no dev or origin/dev ref; nothing can count as merged" >&2
+  exit 2
+fi
+
+VAULTS=$(git for-each-ref --format='%(refname)' refs/heads/vault refs/remotes/origin/vault)
+
+is_vaulted() {
+  # $1 vault suffix, for example n7.fix.x
+  printf '%s\n' "$VAULTS" | grep -qE "^refs/(heads|remotes/origin)/vault/([^/]+/)?$(printf '%s' "$1" | sed 's/[.]/\\./g')\$"
+}
+
+is_merged() {
+  local sha="$1" r
+  for r in $DEV_REFS; do
+    git merge-base --is-ancestor "$sha" "$r" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+PICK_REFS=()
+PICK_SHAS=()
+while read -r ref sha; do
+  [ -n "$ref" ] || continue
+  name=${ref#refs/heads/safety/}
+  # Pattern-1 allocator anchor: kept forever.
+  if printf '%s' "$name" | grep -qE '^(v[0-9]{4}\.[0-9]+/)?n[0-9]+\.[a-z]+\.[^/]+$'; then
+    continue
+  fi
+  # Pattern-2 snapshot: <branch>-<timestamp>.
+  base=$(printf '%s' "$name" | sed -nE 's/^(.+)-[0-9]{8}([-T]?[0-9]{4,6})?$/\1/p')
+  [ -n "$base" ] || base=$(printf '%s' "$name" | sed -nE 's/^(.+)-[0-9]{10}$/\1/p')
+  if [ -z "$base" ]; then
+    echo "  keep $ref (not a Pattern-2 snapshot name)"
+    continue
+  fi
+  case "$base" in
+    pool/*) suffix=${base##*/} ;;
+    *) echo "  keep $ref (snapshot of $base, not a pool branch)"; continue ;;
+  esac
+  if ! is_merged "$sha"; then
+    echo "  keep $ref (not merged into dev)"; continue
+  fi
+  if ! is_vaulted "$suffix"; then
+    echo "  keep $ref (no vault ref for $suffix)"; continue
+  fi
+  PICK_REFS+=("$ref"); PICK_SHAS+=("$sha")
+  if $APPLY; then echo "  bundle $ref ($sha)"; else echo "  would bundle $ref ($sha)"; fi
+done <<EOF
+$(git for-each-ref --format='%(refname) %(objectname)' refs/heads/safety)
+EOF
+
+if [ "${#PICK_REFS[@]}" -eq 0 ]; then
+  echo "ok: no released safety snapshot to collect"
+  exit 0
+fi
+
+TRASH="$HOME/.Trash/git-branch-trash"
+BUNDLE="$TRASH/$REPO_NAME-$(date +%Y-%m-%d).bundle"
+[ -e "$BUNDLE" ] && BUNDLE="$TRASH/$REPO_NAME-$(date +%Y-%m-%d-%H%M%S).bundle"
+
+if ! $APPLY; then
+  echo "dry run: ${#PICK_REFS[@]} ref(s) would go to $BUNDLE; re-run with --apply"
+  exit 0
+fi
+
+mkdir -p "$TRASH"
+if ! git bundle create -q "$BUNDLE" ${PICK_REFS[@]+"${PICK_REFS[@]}"} 2>/dev/null; then
+  echo "X gc-safety: could not write $BUNDLE; no ref deleted" >&2
+  exit 1
+fi
+if ! git bundle verify -q "$BUNDLE" >/dev/null 2>&1; then
+  echo "X gc-safety: $BUNDLE does not verify; no ref deleted" >&2
+  exit 1
+fi
+HEADS=$(git bundle list-heads "$BUNDLE")
+i=0
+while [ "$i" -lt "${#PICK_REFS[@]}" ]; do
+  if ! printf '%s\n' "$HEADS" | grep -qxF "${PICK_SHAS[$i]} ${PICK_REFS[$i]}"; then
+    echo "X gc-safety: $BUNDLE misses ${PICK_REFS[$i]} at ${PICK_SHAS[$i]}; no ref deleted" >&2
+    exit 1
+  fi
+  i=$((i+1))
+done
+
+i=0
+while [ "$i" -lt "${#PICK_REFS[@]}" ]; do
+  git update-ref -d "${PICK_REFS[$i]}" "${PICK_SHAS[$i]}"
+  i=$((i+1))
+done
+echo "ok: ${#PICK_REFS[@]} ref(s) bundled to $BUNDLE and deleted"
+echo "restore: git fetch '$BUNDLE' 'refs/heads/safety/*:refs/heads/safety/*'"

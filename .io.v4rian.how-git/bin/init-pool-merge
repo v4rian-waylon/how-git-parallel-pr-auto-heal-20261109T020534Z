@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# init-pool-merge - local CLI for opening a pool/* → dev PR.
+#
+# Thin wrapper around `gh pr create` that pre-loads the v4rian PR body
+# skeleton from .github/PULL_REQUEST_TEMPLATE.md so the developer
+# starts from the right shape. After dispatch the validate-pr-open
+# workflow fires server side: it amends the title with the canonical
+# vYYYY.X.Y derived from bin/version, runs the shared auto-fix pass
+# over the body, embeds the workflow signature, and posts the required
+# opened-via-correct-flow status check.
+#
+# Opening a pool/* -> dev PR is a developer action with no admin
+# requirement. validate-pr-open hard-rejects a non-admin author only on
+# dev -> main release PRs, which init-release handles; this wrapper does
+# not gate on admin.
+#
+# Behavior:
+#
+#   * Verifies current branch matches pool/nN.kind.short-name shape.
+#   * Verifies origin/dev is reachable so the PR has a real base.
+#   * Verifies the working tree is clean and the branch is pushed to
+#     origin at the same SHA HEAD points to locally. PRs against an
+#     unpushed local SHA are rejected by GitHub anyway; this catches
+#     it earlier with a kinder message.
+#   * Loads the body skeleton from .github/PULL_REQUEST_TEMPLATE.md if
+#     it exists; falls back to an empty body if missing (the workflow
+#     will still amend it).
+#   * Runs `gh pr create --template ...` (or opens $EDITOR with the
+#     template pre-loaded for body when --edit is passed).
+#   * Reports the PR URL and a one-line note about the validate-pr-open
+#     amendment cycle that will follow.
+#
+# Usage:
+#   init-pool-merge                       open the PR with the template body as-is
+#   init-pool-merge --edit                open $EDITOR with the template pre-loaded
+#   init-pool-merge --title "..."         override the placeholder title
+#   init-pool-merge --body "..."          inline body (skips template)
+#   init-pool-merge --body-file path      body from file (skips template)
+#   init-pool-merge --repo OWNER/REPO     override target repo
+#   init-pool-merge --dry-run             show what would dispatch; no API
+#   init-pool-merge -h | --help           print this help
+#
+# Exit codes:
+#   0  PR opened (or --dry-run plan printed, or help)
+#   2  usage error or a refused precondition: not a git repo, off-grid
+#      mode (use bin/finalize-pool-merge), branch not pool/nN.kind.short,
+#      dirty tree, branch not pushed at HEAD's SHA, no --repo and no
+#      origin, body file not found
+#   3  gh CLI missing or no GitHub token (GH_TOKEN, CREATE_POOL_BRANCH_TOKEN
+#      or gh auth login)
+#   N  any other code is gh pr create's own exit code
+
+set -euo pipefail
+
+usage() { sed -n '2,51p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# --help needs no repo and no mode: answer it before any precondition.
+for _arg in "$@"; do case "$_arg" in -h|--help) usage 0 ;; esac; done
+
+# ---------------------------------------------------------------------------
+# Locate the repo + namespace + template paths regardless of cwd
+# ---------------------------------------------------------------------------
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+REPO_ROOT=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X init-pool-merge: not inside a git repo" >&2
+  exit 2
+fi
+
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR/scripts/_lib.sh"
+
+# Off-grid mode does not use PRs - the local merge + bin/finalize-pool-merge
+# path is the authoritative close-up. Refuse here so an admin does not
+# accidentally open a PR against a remote the repo no longer considers
+# authoritative.
+MODE_VAL=$(get_mode)
+if [ "$MODE_VAL" = "off-grid" ]; then
+  echo "X init-pool-merge: repo is in off-grid mode; PRs are not the close-up path." >&2
+  echo "  Off-grid close-up runs locally:" >&2
+  echo "    1. git checkout dev && git merge --no-ff <pool/branch> -m '...'" >&2
+  echo "    2. bin/finalize-pool-merge   # amends, tags, vaults, pushes wherever origin points" >&2
+  echo "  Or flip back to connected first: bin/set-mode connected" >&2
+  exit 2
+fi
+
+# Merge policy (MERGE_POLICY + WARP): the PR stays the default path; when
+# warp is on or dev_merge_pr=optional, say that a direct merge is allowed
+# so the developer can pick the faster path knowingly.
+# shellcheck source=../scripts/_merge_policy.sh
+. "$NS_DIR/scripts/_merge_policy.sh"
+if [ "$(warp_state)" = "on" ]; then
+  echo "!! WARP MODE ON: pool -> dev may merge without a PR (git checkout dev && git merge --no-ff <pool> && git push origin dev); gates still apply"
+elif [ "$(mp_get dev_merge_pr)" = "optional" ]; then
+  echo "  merge policy: dev_merge_pr=optional; a direct pool -> dev merge push is also allowed"
+fi
+if [ "$(mp_effective dev_merge_approval)" = "required" ]; then
+  echo "  merge policy: dev_merge_approval=required; the PR needs an approving review from another allowed merger"
+fi
+
+# Pool size cap (dev_merge_max_commits, never lifted by warp): refuse to
+# open a PR for a pool bigger than one feature area.
+SIZE_BASE=$(git -C "$REPO_ROOT" rev-parse -q --verify refs/remotes/origin/dev 2>/dev/null \
+  || git -C "$REPO_ROOT" rev-parse -q --verify refs/heads/dev 2>/dev/null || true)
+if [ -n "$SIZE_BASE" ] && ! SIZE_REASON=$(cd "$REPO_ROOT" && mp_check_branch_size HEAD "$SIZE_BASE"); then
+  echo "X init-pool-merge: $SIZE_REASON" >&2
+  exit 2
+fi
+
+TEMPLATE_FILE="$REPO_ROOT/.github/PULL_REQUEST_TEMPLATE.md"
+
+# ---------------------------------------------------------------------------
+# Flags
+# ---------------------------------------------------------------------------
+EDIT=false
+TITLE_OVERRIDE=""
+BODY_OVERRIDE=""
+BODY_FILE=""
+REPO=""
+DRY_RUN=false
+
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --edit)        EDIT=true; shift ;;
+    --title)       TITLE_OVERRIDE="$2"; shift 2 ;;
+    --body)        BODY_OVERRIDE="$2"; shift 2 ;;
+    --body-file)   BODY_FILE="$2"; shift 2 ;;
+    --repo)        REPO="$2"; shift 2 ;;
+    --dry-run)     DRY_RUN=true; shift ;;
+    -h|--help)     usage 0 ;;
+    *) echo "X unknown flag: $1" >&2; usage 2 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Branch + tree validation
+# ---------------------------------------------------------------------------
+HEAD=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)
+# Accept both the legacy flat layout (pool/nN.kind.short) and the
+# vYYYY.MAIN/ prefixed layout introduced when active allocation gained
+# release-line classification. Mirrors the canonical pattern from the
+# pre-push hook and the validate-pr-open script so all gates agree on
+# the same kind allowlist (including doc).
+if ! [[ "$HEAD" =~ $HG_POOL_PREFIX_RE ]]; then
+  echo "X init-pool-merge: current branch '$HEAD' is not a pool/[vYYYY.MAIN/]nN.kind.short-name branch" >&2
+  echo "  Only pool/* branches open PRs into dev. Use bin/create-pool-branch to allocate one." >&2
+  exit 2
+fi
+
+# Clean tree check (uncommitted changes would surprise the dev when the
+# PR doesn't carry them).
+if ! git -C "$REPO_ROOT" diff --quiet || ! git -C "$REPO_ROOT" diff --cached --quiet; then
+  echo "X init-pool-merge: working tree is dirty. Commit or stash before opening the PR." >&2
+  exit 2
+fi
+
+# Local-vs-remote sync check.
+LOCAL_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD)
+REMOTE_SHA=$(git -C "$REPO_ROOT" rev-parse "origin/$HEAD" 2>/dev/null || echo "")
+if [ -z "$REMOTE_SHA" ]; then
+  echo "X init-pool-merge: branch '$HEAD' is not yet pushed to origin. Push first: git push -u origin $HEAD" >&2
+  exit 2
+fi
+if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+  echo "X init-pool-merge: local HEAD ($LOCAL_SHA) differs from origin/$HEAD ($REMOTE_SHA). Push first: git push" >&2
+  exit 2
+fi
+
+# Resolve target repo from origin if not overridden.
+if [ -z "$REPO" ]; then
+  ORIGIN_URL=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)
+  if [ -z "$ORIGIN_URL" ]; then
+    echo "X init-pool-merge: --repo not supplied and origin remote is not set" >&2
+    exit 2
+  fi
+  REPO=$(echo "$ORIGIN_URL" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+fi
+
+# ---------------------------------------------------------------------------
+# gh CLI required
+# ---------------------------------------------------------------------------
+if ! command -v gh >/dev/null 2>&1; then
+  echo "X init-pool-merge: gh CLI is required (install: brew install gh on macOS, sudo apt install gh on Debian/Ubuntu)" >&2
+  exit 3
+fi
+
+# Token resolution: GH_TOKEN env, then CREATE_POOL_BRANCH_TOKEN, then gh auth.
+TOKEN="${GH_TOKEN:-${CREATE_POOL_BRANCH_TOKEN:-}}"
+if [ -z "$TOKEN" ]; then
+  TOKEN=$(gh auth token 2>/dev/null || true)
+fi
+if [ -z "$TOKEN" ]; then
+  echo "X init-pool-merge: no GitHub token available (set GH_TOKEN, CREATE_POOL_BRANCH_TOKEN, or run 'gh auth login')" >&2
+  exit 3
+fi
+
+# ---------------------------------------------------------------------------
+# Actor note (informational only). Opening a pool/* -> dev PR is a developer
+# action and carries NO admin requirement: validate-pr-open hard-rejects a
+# non-admin author ONLY on dev -> main release PRs (validate-pr-open.sh step
+# 2), which are init-release's domain, not this script's. Gating pool -> dev
+# behind admin here contradicted the documented developer workflow and blocked
+# the very role meant to open these PRs, so no admin gate fires.
+# ---------------------------------------------------------------------------
+ACTOR=$(GH_TOKEN="$TOKEN" gh api user --jq '.login' 2>/dev/null || true)
+[ -n "$ACTOR" ] && echo "  opening as actor=${ACTOR}"
+
+# ---------------------------------------------------------------------------
+# Body resolution: --body > --body-file > template
+# ---------------------------------------------------------------------------
+WORK=$(mktemp -d -t init-pool-merge-XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+BODY_PATH="$WORK/body.md"
+
+if [ -n "$BODY_OVERRIDE" ]; then
+  printf '%s\n' "$BODY_OVERRIDE" > "$BODY_PATH"
+elif [ -n "$BODY_FILE" ]; then
+  if [ ! -f "$BODY_FILE" ]; then
+    echo "X --body-file '$BODY_FILE' not found" >&2
+    exit 2
+  fi
+  cp "$BODY_FILE" "$BODY_PATH"
+elif [ -f "$TEMPLATE_FILE" ]; then
+  cp "$TEMPLATE_FILE" "$BODY_PATH"
+else
+  # No template, no override. Empty body; the validator will amend.
+  : > "$BODY_PATH"
+fi
+
+# Editor pass for --edit.
+if $EDIT; then
+  : "${EDITOR:=vi}"
+  "$EDITOR" "$BODY_PATH"
+fi
+
+# Placeholder title: the validator amends to [KIND] vYYYY.X.Y: <short>
+# from bin/version anyway, so the local default is just enough to satisfy
+# gh's --title requirement.
+if [ -n "$TITLE_OVERRIDE" ]; then
+  TITLE="$TITLE_OVERRIDE"
+else
+  TITLE="[NEW] pending validate-pr-open amendment"
+fi
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+if $DRY_RUN; then
+  echo "[dry-run] target repo: $REPO"
+  echo "[dry-run] head:        $HEAD"
+  echo "[dry-run] base:        dev"
+  echo "[dry-run] title:       $TITLE"
+  echo "[dry-run] body chars:  $(wc -c < "$BODY_PATH" | tr -d ' ')"
+  echo "[dry-run] would call:  gh pr create --repo $REPO --base dev --head $HEAD --title ... --body-file ..."
+  exit 0
+fi
+
+URL=$(GH_TOKEN="$TOKEN" gh pr create \
+  --repo "$REPO" \
+  --base dev \
+  --head "$HEAD" \
+  --title "$TITLE" \
+  --body-file "$BODY_PATH" 2>&1) || {
+  rc=$?
+  echo "X gh pr create failed (rc=$rc):" >&2
+  echo "$URL" >&2
+  exit "$rc"
+}
+
+echo
+echo "ok created pool to dev PR"
+echo "$URL"
+echo
+echo "  the validate-pr-open workflow will amend the title to [KIND] vYYYY.X.Y: <short>"
+echo "  derived from bin/version --next-dev, run the auto-fix pass over the body, embed"
+echo "  the opened-via-correct-flow signature, and post the required status check."

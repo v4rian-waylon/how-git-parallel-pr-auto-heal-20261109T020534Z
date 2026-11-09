@@ -1,0 +1,190 @@
+name: allocate-pool-branch
+
+# Thin dispatcher around .io.v4rian.how-git/scripts/allocate-pool-branch.sh.
+#
+# Entry points (every one funnels into the same script):
+#
+#   - repository_dispatch (event_type: allocate-pool-branch) - fired by
+#     JIRA Automation when a ticket enters the active sprint. The
+#     client_payload carries kind, short_name, jira_key, sprint, and
+#     optional jira_title + jira_description for Claude classification
+#     fallback.
+#
+#   - workflow_dispatch - manual admin invocation from the GitHub UI
+#     or via `gh workflow run`, which is exactly what
+#     bin/create-pool-branch does locally.
+#
+# Authorization: admin-only. The job queries the actor's role on this
+# repo via GitHub's permission API and refuses to proceed unless the
+# response is admin. There is no maintained allowlist; membership in
+# the admin role on the repo IS the allocator authorization.
+#
+# Server side Repository Rules (see .io.v4rian.how-git/rulesets/) pin
+# pool/* and safety/* ref creation to this workflow's GITHUB_TOKEN
+# identity. A determined caller invoking the Git Data API directly
+# from a developer laptop is rejected at the ref-creation layer
+# regardless of how they got here.
+#
+# Retry: the long timeout-minutes lets the script's own exponential
+# backoff on Claude classification ride out transient API failures
+# without GitHub killing the run. Realistic finish is seconds.
+
+on:
+  repository_dispatch:
+    types: [allocate-pool-branch]
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'Branch kind (feature|fix|refactor|r&d|reconcile|doc). Leave blank to classify via Claude from JIRA payload.'
+        required: false
+        type: string
+      short_name:
+        description: 'Slug used as the trailing branch-name segment (lowercase, hyphens; will be normalized).'
+        required: true
+        type: string
+      jira_key:
+        description: 'JIRA key PROJ-NNN. Optional. When supplied, used as the idempotency token + stamped into the branch name. Required unless no_jira=true.'
+        required: false
+        type: string
+      no_jira:
+        description: 'Set to true to allocate without a JIRA key. Branch name omits the JIRA segment, idempotency-by-JIRA is skipped. Admin only (the workflow_dispatch admin gate is the authorization).'
+        required: false
+        type: boolean
+        default: false
+      sprint:
+        description: 'Sprint number (integer). Optional.'
+        required: false
+        type: string
+      requirement:
+        description: 'Active requirement text for the branch. When supplied, the allocator stamps it as the [REQ] initial commit on the pool branch (file + commit body) so auditors and claude can fetch it via get-active-requirement.sh. JIRA-driven dispatches pass this in via the repository_dispatch client_payload.requirement field.'
+        required: false
+        type: string
+
+concurrency:
+  group: allocate-pool-branch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  allocate:
+    runs-on: ubuntu-latest
+    # The App key and the Claude secrets live in v4rian-trusted, which admits
+    # only dev, main and v* tags (docs/ci-trust-model.md); dispatch on dev.
+    environment: v4rian-trusted
+    timeout-minutes: 4320
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the allocator reads landing subjects as the record
+          # of numbers whose branches are gone.
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify actor is repo admin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          echo "→ checking permission for actor=$ACTOR on repo=${GITHUB_REPOSITORY}"
+          PERM=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" --jq '.permission' 2>/dev/null || echo "unknown")
+          echo "→ actor permission = $PERM"
+          if [ "$PERM" != "admin" ]; then
+            echo "✗ refusing to allocate: actor '$ACTOR' has permission '$PERM' (admin required)" >&2
+            exit 1
+          fi
+          echo "✓ admin permission confirmed"
+
+      - name: Resolve inputs across the two trigger shapes
+        id: resolve
+        env:
+          DISPATCH_KIND: ${{ github.event.inputs.kind }}
+          DISPATCH_SHORT: ${{ github.event.inputs.short_name }}
+          DISPATCH_JIRA: ${{ github.event.inputs.jira_key }}
+          DISPATCH_NO_JIRA: ${{ github.event.inputs.no_jira }}
+          DISPATCH_SPRINT: ${{ github.event.inputs.sprint }}
+          DISPATCH_REQUIREMENT: ${{ github.event.inputs.requirement }}
+          REPO_KIND: ${{ github.event.client_payload.kind }}
+          REPO_SHORT: ${{ github.event.client_payload.short_name }}
+          REPO_JIRA: ${{ github.event.client_payload.jira_key }}
+          REPO_NO_JIRA: ${{ github.event.client_payload.no_jira }}
+          REPO_SPRINT: ${{ github.event.client_payload.sprint }}
+          REPO_TITLE: ${{ github.event.client_payload.jira_title }}
+          REPO_DESC: ${{ github.event.client_payload.jira_description }}
+          REPO_REQUIREMENT: ${{ github.event.client_payload.requirement }}
+        run: |
+          set -euo pipefail
+          KIND="${DISPATCH_KIND:-${REPO_KIND:-}}"
+          SHORT="${DISPATCH_SHORT:-${REPO_SHORT:-}}"
+          JIRA="${DISPATCH_JIRA:-${REPO_JIRA:-}}"
+          SPRINT="${DISPATCH_SPRINT:-${REPO_SPRINT:-}}"
+          TITLE="${REPO_TITLE:-}"
+          DESC="${REPO_DESC:-}"
+          REQ="${DISPATCH_REQUIREMENT:-${REPO_REQUIREMENT:-}}"
+          # Normalize the boolean no_jira from both trigger shapes. Empty
+          # or "false" -> "0"; "true" -> "1". The script reads ALLOC_NO_JIRA
+          # as "1"-vs-anything-else so any non-"1" value is treated as
+          # JIRA-required.
+          NO_JIRA_RAW="${DISPATCH_NO_JIRA:-${REPO_NO_JIRA:-}}"
+          case "$NO_JIRA_RAW" in
+            true|TRUE|True|1) NO_JIRA="1" ;;
+            *) NO_JIRA="0" ;;
+          esac
+          {
+            echo "kind=$KIND"
+            echo "short_name=$SHORT"
+            echo "jira_key=$JIRA"
+            echo "no_jira=$NO_JIRA"
+            echo "sprint=$SPRINT"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "jira_title<<__TITLE_EOF__"
+            printf '%s\n' "$TITLE"
+            echo "__TITLE_EOF__"
+            echo "jira_description<<__DESC_EOF__"
+            printf '%s\n' "$DESC"
+            echo "__DESC_EOF__"
+            echo "requirement<<__REQ_EOF__"
+            printf '%s\n' "$REQ"
+            echo "__REQ_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      # Pool and safety refs pass the rulesets only under the CI bot App's
+      # identity. Without the App, bin/create-pool-branch allocates locally
+      # as the admin instead of dispatching here.
+      - name: Mint CI bot App token for the ref creations
+        id: app_token
+        if: vars.CI_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CI_BOT_APP_ID }}
+          private-key: ${{ secrets.CI_BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Run the canonical allocator script
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALLOC_PUSH_TOKEN: ${{ steps.app_token.outputs.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ALLOC_KIND: ${{ steps.resolve.outputs.kind }}
+          ALLOC_SHORT_NAME: ${{ steps.resolve.outputs.short_name }}
+          ALLOC_JIRA_KEY: ${{ steps.resolve.outputs.jira_key }}
+          ALLOC_NO_JIRA: ${{ steps.resolve.outputs.no_jira }}
+          ALLOC_SPRINT: ${{ steps.resolve.outputs.sprint }}
+          ALLOC_JIRA_TITLE: ${{ steps.resolve.outputs.jira_title }}
+          ALLOC_JIRA_DESC: ${{ steps.resolve.outputs.jira_description }}
+          ALLOC_REQUIREMENT: ${{ steps.resolve.outputs.requirement }}
+        run: |
+          set -euo pipefail
+          OUT_JSON=$(bash .io.v4rian.how-git/scripts/allocate-pool-branch.sh)
+          echo "$OUT_JSON"
+          {
+            echo "## Allocator result"
+            echo ""
+            echo '```json'
+            echo "$OUT_JSON"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

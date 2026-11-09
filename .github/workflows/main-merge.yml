@@ -1,0 +1,59 @@
+name: main-merge
+
+# Thin admin-only entry: re-runs the main release claim (Release object
+# on the reused dev tag, main merge message shape) when the automatic
+# run did not complete.
+#
+# It owns no logic. The automatic claim is ci-dispatch.yml's
+# pr-merge-main trigger (every push to main); this file calls that same
+# workflow with trigger=pr-merge-main on main, which runs
+# ci/audits/pr-merge-main/required.claim.sh -> scripts/workflows/
+# claim-retry.sh --target main. No event trigger, so a main push never
+# claims twice.
+#
+# Off-grid twin: .io.v4rian.how-git/bin/ci-local --workflow main-merge
+
+on:
+  workflow_dispatch:
+
+# Permissions: exactly ci-dispatch.yml's set. GitHub never elevates
+# permissions down a call chain, so the caller must grant what the called
+# workflow requests; the admin gate and ci-dispatch's ref validator are
+# what keep this token away from untrusted code. The set sits at workflow
+# level, which GitHub applies to every job including the calling one (its
+# docs give a called workflow the default token only when the calling job
+# has no permissions at all).
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  checks: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  admin:
+    name: verify actor is repo admin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: verify actor is repo admin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: bash .io.v4rian.how-git/scripts/workflows/verify-actor-admin.sh
+
+  claim:
+    needs: admin
+    uses: ./.github/workflows/ci-dispatch.yml
+    with:
+      trigger: pr-merge-main
+      ref: main
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CI_BOT_APP_PRIVATE_KEY: ${{ secrets.CI_BOT_APP_PRIVATE_KEY }}

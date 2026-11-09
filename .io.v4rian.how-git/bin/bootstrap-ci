@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# bootstrap-ci - thin wrapper around the bootstrap-ci.yml workflow.
+#
+# All bootstrap work lives in the workflow runtime (apply repo rules,
+# branch protection, required status checks, merge defaults, topics,
+# claude install probe, consumer cleanup). The workflow is the sole
+# place that mutates repo state; this wrapper only validates the
+# operator's preconditions and dispatches the workflow.
+#
+# What this script does:
+#   1. Resolves origin and a GitHub token (same order as open-pr.sh).
+#   2. Verifies the operator holds admin role on the target repo.
+#      Workflow_dispatch requires write access, but admin is the
+#      stricter guard the bootstrap surface needs since the workflow
+#      itself attempts admin-only mutations.
+#   3. Calls `gh workflow run bootstrap-ci.yml -f mode=<mode>` against
+#      the resolved owner/repo.
+#   4. Polls /repos/<owner>/<repo>/actions/workflows/bootstrap-ci.yml/runs
+#      for the newly created run id, then streams its log via
+#      `gh run watch --exit-status` and exits with the workflow's
+#      exit code.
+#
+# Off-grid repos do not run bootstrap-ci. The whole purpose is to wire
+# up GitHub-side state, which is inert when origin is not authoritative.
+#
+# Usage:
+#   bootstrap-ci                run the workflow in apply mode
+#   bootstrap-ci --check        run the workflow in check (read-only) mode
+#   bootstrap-ci --dry-run      run the workflow in dry-run mode
+#   bootstrap-ci -h | --help    print this help
+
+set -uo pipefail
+
+# Announce-upfront per the silence-is-success-in-sh-land rule.
+_boot_origin=$(git config --get remote.origin.url 2>/dev/null || true)
+if [ -z "$_boot_origin" ]; then
+  _boot_origin_short='<no origin>'
+else
+  _boot_origin_short=$(printf '%s' "$_boot_origin" \
+    | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+fi
+echo "→ bootstrap-ci starting on $_boot_origin_short"
+
+# Loud-on-failure EXIT trap.
+trap '_rc=$?; if [ "$_rc" -ne 0 ]; then printf "\nX %s exited with status %d (last command: %s)\n" "$(basename "$0")" "$_rc" "$BASH_COMMAND" >&2; fi' EXIT
+
+# ----------------------------------------------------------------------------
+# Locate the repo root and the namespace dir relative to this script
+# ----------------------------------------------------------------------------
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR_FULL=$(dirname "$SCRIPT_DIR")
+NS_DIR=$(basename "$NS_DIR_FULL")
+REPO_ROOT=$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X bootstrap-ci: not inside a git repo" >&2
+  exit 2
+fi
+
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR_FULL/scripts/_lib.sh"
+
+# Off-grid repos do not run bootstrap-ci.
+REPO_MODE_VAL=$(get_mode 2>/dev/null || echo "connected")
+if [ "$REPO_MODE_VAL" = "off-grid" ]; then
+  echo "X bootstrap-ci: repo is in off-grid mode; GitHub-side CI bootstrap does not apply." >&2
+  echo "  Off-grid governance lives in admins.txt plus local hooks; remote CI setup is inert." >&2
+  echo "  Flip back to connected first if this repo is rejoining a GitHub remote:" >&2
+  echo "    bin/set-mode connected" >&2
+  exit 2
+fi
+
+# ----------------------------------------------------------------------------
+# Parse flags
+# ----------------------------------------------------------------------------
+MODE="apply"   # apply | check | dry-run
+CLAUDE_TOKEN="${CLAUDE_TOKEN:-}"   # optional; also via --claude-token
+CI_APP_PEM="${CI_APP_PEM:-}"       # optional; also via --ci-app-pem <path>
+CI_APP_ID="${CI_APP_ID:-}"         # optional; auto-derived from the repo installation
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)    MODE="check"; shift ;;
+    --dry-run)  MODE="dry-run"; shift ;;
+    --claude-token) CLAUDE_TOKEN="$2"; shift 2 ;;
+    --ci-app-pem)   CI_APP_PEM="$2"; shift 2 ;;
+    --ci-app-id)    CI_APP_ID="$2"; shift 2 ;;
+    -h|--help)  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+if [ -z "$CLAUDE_TOKEN" ]; then
+  echo "!  no --claude-token / CLAUDE_TOKEN provided: step 9b can only PROBE the"
+  echo "   CLAUDE_CODE_OAUTH_TOKEN secret; claude-judgment audits stay degraded"
+  echo "   until it is set (mint once with: claude setup-token)."
+fi
+
+# ----------------------------------------------------------------------------
+# Token resolution (mirrors open-pr.sh)
+# ----------------------------------------------------------------------------
+resolve_token() {
+  if [ -n "${GH_TOKEN:-}" ]; then
+    printf '%s' "$GH_TOKEN"; return 0
+  fi
+  if [ -n "${CREATE_POOL_BRANCH_TOKEN:-}" ]; then
+    printf '%s' "$CREATE_POOL_BRANCH_TOKEN"; return 0
+  fi
+  if command -v gh >/dev/null 2>&1; then
+    local t
+    t=$(gh auth token 2>/dev/null || true)
+    if [ -n "$t" ]; then printf '%s' "$t"; return 0; fi
+  fi
+  local gcm_dir="$HOME/.gcm/store/git/https/github.com"
+  if [ -d "$gcm_dir" ]; then
+    local f
+    for f in "$gcm_dir"/*.credential; do
+      [ -f "$f" ] || continue
+      local t
+      t=$(head -1 "$f" 2>/dev/null || true)
+      if [ -n "$t" ]; then printf '%s' "$t"; return 0; fi
+    done
+  fi
+  return 3
+}
+
+# ----------------------------------------------------------------------------
+# Derive owner/repo from origin remote (mirrors open-pr.sh)
+# ----------------------------------------------------------------------------
+derive_owner_repo() {
+  local url
+  url=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)
+  if [ -z "$url" ]; then
+    echo "X origin remote not configured" >&2
+    return 2
+  fi
+  echo "$url" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||'
+}
+
+# ----------------------------------------------------------------------------
+# Resolve token + token source label
+# ----------------------------------------------------------------------------
+TOKEN_SRC="(none)"
+if [ -n "${GH_TOKEN:-}" ]; then
+  TOKEN_SRC='$GH_TOKEN'
+elif [ -n "${CREATE_POOL_BRANCH_TOKEN:-}" ]; then
+  TOKEN_SRC='$CREATE_POOL_BRANCH_TOKEN'
+elif command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1; then
+  TOKEN_SRC='gh auth token'
+elif [ -d "$HOME/.gcm/store/git/https/github.com" ]; then
+  TOKEN_SRC='gcm credential store'
+fi
+
+TOKEN=$(resolve_token) || {
+  echo "X bootstrap-ci: no GitHub token available. Resolve one of:" >&2
+  echo "  1. export GH_TOKEN=<token>" >&2
+  echo "  2. gh auth login (after 'brew install gh' or 'sudo apt install gh')" >&2
+  echo "  3. ~/.gcm/store/git/https/github.com/<account>.credential (line 1 = token)" >&2
+  exit 3
+}
+
+OWNER_REPO=$(derive_owner_repo)
+echo "-> bootstrap-ci ($MODE) on $OWNER_REPO"
+echo "   token source: $TOKEN_SRC"
+
+# ----------------------------------------------------------------------------
+# Precondition 1: operator holds admin role on the target repo.
+#
+# The workflow attempts admin-only mutations under GITHUB_TOKEN. The
+# wrapper still enforces operator-admin so a non-admin operator who can
+# theoretically dispatch the workflow does not fire it and watch every
+# admin step fail in the log.
+# ----------------------------------------------------------------------------
+ACTOR=$(curl -sS \
+  -H "Authorization: token $TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/user" 2>/dev/null \
+  | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('login',''))
+except Exception:
+    print('')" 2>/dev/null || true)
+if [ -z "$ACTOR" ]; then
+  echo "X bootstrap-ci: could not resolve the token's GitHub login" >&2
+  exit 3
+fi
+
+PERM=$(curl -sS \
+  -H "Authorization: token $TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/$OWNER_REPO/collaborators/$ACTOR/permission" 2>/dev/null \
+  | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('permission',''))
+except Exception:
+    print('')" 2>/dev/null || true)
+case "$PERM" in
+  admin)
+    echo "   actor: $ACTOR (admin on $OWNER_REPO)"
+    ;;
+  *)
+    echo "X bootstrap-ci: actor '$ACTOR' needs admin role on $OWNER_REPO (current: '$PERM')" >&2
+    echo "  Workflow dispatch under a non-admin token will fire steps that need admin" >&2
+    echo "  and report visible 422s in the workflow log; this wrapper guards against that." >&2
+    exit 4
+    ;;
+esac
+
+# ----------------------------------------------------------------------------
+# Precondition 2: gh CLI present (required for workflow run + run watch)
+# ----------------------------------------------------------------------------
+if ! command -v gh >/dev/null 2>&1; then
+  echo "X bootstrap-ci: 'gh' CLI not installed" >&2
+  echo "  install: brew install gh   (macOS)" >&2
+  echo "  install: sudo apt install gh   (Debian/Ubuntu)" >&2
+  exit 5
+fi
+
+# Ensure gh is authenticated against the resolved token. The wrapper
+# exports GH_TOKEN into the gh process so gh picks the same token the
+# precondition check used.
+export GH_TOKEN="$TOKEN"
+
+# ----------------------------------------------------------------------------
+# Capture the operator's gh session token; this carries to the workflow
+# as a transient input so the workflow's gh api calls run under the same
+# authority the operator has on their laptop. The token is NOT stored as
+# a repo secret; it lives only inside this single workflow run.
+# ----------------------------------------------------------------------------
+ADMIN_TOKEN=$(gh auth token 2>/dev/null) || { echo "X bootstrap-ci: gh auth token unavailable" >&2; exit 1; }
+[ -n "$ADMIN_TOKEN" ] || { echo "X bootstrap-ci: gh auth token returned empty" >&2; exit 1; }
+
+# ----------------------------------------------------------------------------
+# CI bot App enrollment (set once; everything stays in the operator shell)
+#
+# The claim's protected pushes (vault create, pool delete, reconcile
+# candidate publication) ride a CI bot App installation token in CI. The
+# App itself is created and installed by a human once (GitHub requires
+# it); this block makes the rest set-once: given the downloaded private
+# key, it stores the CI_BOT_APP_PRIVATE_KEY secret and the CI_BOT_APP_ID
+# variable directly from the shell under the operator's own gh session -
+# the key never transits a workflow input. The App id is auto-derived
+# from the repo installation when not passed. Without --ci-app-pem the
+# block only PROBES and reports, so bootstrap stays re-runnable.
+# ----------------------------------------------------------------------------
+APP_ID_FROM_REPO=$(gh api "/repos/$OWNER_REPO/installation" --jq '.app_id // empty' 2>/dev/null || true)
+# gh prints the error body on a non-2xx answer (the endpoint wants an App
+# JWT, so a user token gets a 401 JSON); only a number is an app id.
+printf '%s' "$APP_ID_FROM_REPO" | grep -qE '^[0-9]+$' || APP_ID_FROM_REPO=""
+# GitHub Apps are created under the owning account: an org's settings page
+# for an org-owned repo, the user's own settings page otherwise.
+if [ "$(gh api "users/${OWNER_REPO%%/*}" --jq .type 2>/dev/null)" = "Organization" ]; then
+  APPS_NEW_URL="https://github.com/organizations/${OWNER_REPO%%/*}/settings/apps/new"
+else
+  APPS_NEW_URL="https://github.com/settings/apps/new"
+fi
+if [ -n "$CI_APP_PEM" ]; then
+  if [ ! -f "$CI_APP_PEM" ]; then
+    echo "X bootstrap-ci: --ci-app-pem file not found: $CI_APP_PEM" >&2
+    exit 2
+  fi
+  APP_ID_EFFECTIVE="${CI_APP_ID:-$APP_ID_FROM_REPO}"
+  if ! printf '%s' "$APP_ID_EFFECTIVE" | grep -qE '^[0-9]+$'; then
+    echo "X bootstrap-ci: CI bot App id unresolvable - the App is not installed on $OWNER_REPO yet" >&2
+    echo "  create + install it once: $APPS_NEW_URL" >&2
+    echo "  (Contents: read and write; install on $OWNER_REPO), then re-run with --ci-app-pem" >&2
+    exit 2
+  fi
+  if [ "$MODE" = "apply" ]; then
+    # The key belongs in the v4rian-trusted environment, which must exist
+    # first (docs/ci-trust-model.md); the step is idempotent.
+    OWNER_REPO="$OWNER_REPO" GH_TOKEN="$(gh auth token)" REPO_ROOT="$REPO_ROOT" NS_DIR="$NS_DIR" MODE=apply \
+      bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" trusted_env >/dev/null \
+      || { echo "X bootstrap-ci: v4rian-trusted environment unavailable; the App key stays out of the repo" >&2; exit 2; }
+    gh secret set CI_BOT_APP_PRIVATE_KEY -R "$OWNER_REPO" --env v4rian-trusted < "$CI_APP_PEM" \
+      || { echo "X bootstrap-ci: CI_BOT_APP_PRIVATE_KEY secret write failed" >&2; exit 2; }
+    gh variable set CI_BOT_APP_ID -R "$OWNER_REPO" --body "$APP_ID_EFFECTIVE" \
+      || { echo "X bootstrap-ci: CI_BOT_APP_ID variable write failed" >&2; exit 2; }
+    echo "-> CI bot App enrolled (app id $APP_ID_EFFECTIVE): secret + variable set from the shell session"
+  else
+    echo "-> [$MODE] would enroll CI bot App (app id ${APP_ID_EFFECTIVE}) from $CI_APP_PEM"
+  fi
+else
+  APP_VAR=$(gh variable get CI_BOT_APP_ID -R "$OWNER_REPO" 2>/dev/null || true)
+  if [ -n "$APP_VAR" ]; then
+    echo "-> CI bot App already enrolled (CI_BOT_APP_ID=$APP_VAR); protected pushes ride its token in CI"
+  elif [ -n "$APP_ID_FROM_REPO" ]; then
+    echo "!  CI bot App is installed on $OWNER_REPO (app id $APP_ID_FROM_REPO) but not enrolled;"
+    echo "   re-run with --ci-app-pem <downloaded .pem> to finish the set once enrollment"
+  else
+    echo "!  no CI bot App on $OWNER_REPO: CI claim will hand protected transitions to"
+    echo "   bin/post-merge-lifecycle. To automate them fully, create the App once"
+    echo "   ($APPS_NEW_URL, Contents: read and write,"
+    echo "   install on $OWNER_REPO) and re-run: bootstrap-ci --ci-app-pem <path to .pem>"
+  fi
+fi
+
+# ----------------------------------------------------------------------------
+# Dispatch the workflow
+#
+# gh workflow run defaults to the repo's default branch when --ref is
+# absent; pre-merge testing of bootstrap-ci.yml against a pool branch
+# requires the dispatcher to read the workflow file from THAT branch so
+# trigger registration matches the operator's working tree. The current
+# branch on the operator's checkout is resolved via git rev-parse; when
+# the script runs outside a git working tree the value falls through to
+# the repo default branch resolved through the GitHub API.
+# ----------------------------------------------------------------------------
+# Every step runs here, under the operator's own gh session. The admin
+# token and a Claude token never leave this machine: workflow_dispatch
+# inputs are not secret (they reach the event payload, logs and webhooks),
+# so the steps no longer run inside a dispatched workflow
+# (docs/ci-trust-model.md).
+STEPS="actions_enabled workflows_enabled seed_dev apply_rules required_checks merge_commit_defaults merge_mode_lock disable_auto_delete topics trusted_env claude_setup consumer_cleanup report"
+echo "-> bootstrap-ci ($MODE) on $OWNER_REPO, run locally"
+for step in $STEPS; do
+  if ! OWNER_REPO="$OWNER_REPO" GH_TOKEN="$ADMIN_TOKEN" TOKEN="$ADMIN_TOKEN" GITHUB_TOKEN="$ADMIN_TOKEN" \
+       REPO_ROOT="$REPO_ROOT" NS_DIR="$NS_DIR" MODE="$MODE" BOOTSTRAP_LOCAL=1 \
+       CLAUDE_TOKEN_INPUT="${CLAUDE_TOKEN:-}" TOKEN_SRC="operator gh session (local)" \
+       bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" "$step"; then
+    echo "X bootstrap-ci: step $step failed; fix the cause above and re-run (every step is idempotent)" >&2
+    exit 6
+  fi
+done
+echo "ok: bootstrap-ci ($MODE) complete on $OWNER_REPO"
+exit 0

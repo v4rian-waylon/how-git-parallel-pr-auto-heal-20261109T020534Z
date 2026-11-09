@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# identity - commit identity from the origin's GitHub org, and source time.
+#
+# Usage:
+#   identity                   "<name> <email>" for this repo
+#   identity --name|--email    one field
+#   identity --export          export lines for eval (hooks, allocator, claim)
+#   identity --check EMAIL     rc 0 when EMAIL may author or commit here
+#   identity --source-date P   "<epoch> <+hhmm>": P's mtime with the offset
+#                              real at that instant (GIT_AUTHOR_DATE form)
+#   identity --utc-stamp       YYYYMMDDTHHMMSSZ for ref and zip names
+#
+# Map: <org> <email> <name>, looked up in $HOW_GIT_IDENTITY_MAP, then
+# identity-map.local, then identity-map (namespace). `git config how-git.org`
+# pins the org for remotes without one (off-grid). <Model> in a name is
+# $HOW_GIT_MODEL. Joel's own identity passes --check only under
+# HOW_GIT_SNAPSHOT_REBUILD=1 or `git config how-git.snapshotRebuild true`.
+# Exit 3 when the org has no mapping.
+
+set -euo pipefail
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../scripts/lib/identity.sh
+. "$SCRIPT_DIR/../scripts/lib/identity.sh"
+
+field() { local hit; hit=$(identity_lookup) || exit 3; case "$1" in
+  email) printf '%s\n' "${hit%%	*}" ;; name) printf '%s\n' "${hit#*	}" ;;
+  both) printf '%s <%s>\n' "${hit#*	}" "${hit%%	*}" ;; esac; }
+
+case "${1:-}" in
+  ''|--both)      field both ;;
+  --name)         field name ;;
+  --email)        field email ;;
+  --export)
+    hit=$(identity_lookup) || exit 3
+    for k in AUTHOR COMMITTER; do
+      printf 'export GIT_%s_NAME=%q\n' "$k" "${hit#*	}"
+      printf 'export GIT_%s_EMAIL=%q\n' "$k" "${hit%%	*}"
+    done ;;
+  --check)        identity_email_allowed "${2:?email}" ;;
+  --source-date)  identity_source_date "${2:?path}" ;;
+  --utc-stamp)    identity_utc_stamp ;;
+  -h|--help)      sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "X identity: unknown flag $1 (see --help)" >&2; exit 2 ;;
+esac

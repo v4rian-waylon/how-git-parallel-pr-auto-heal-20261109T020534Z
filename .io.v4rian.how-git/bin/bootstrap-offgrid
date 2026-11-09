@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# bootstrap-offgrid - seed a brand-new repo's origin with main and dev and
+# flip it off-grid, the documented new-repo bootstrap as one tool.
+#
+# Run in a fresh copy of the template (the .io.v4rian.how-git namespace
+# present, origin pointing at an empty repo). In order:
+#   1. Refuse when origin already has main or dev (bootstrap runs once; a
+#      seeded repo moves through pools, never through this tool).
+#   2. Activate the hooks (scripts/heal.sh).
+#   3. When the repo has no commit yet, commit the namespace, .gitignore
+#      and .github (staged by name) as the bootstrap commit on main.
+#   4. bin/set-mode off-grid (local; needs no GitHub admin).
+#   5. Point dev at main and publish both in ONE atomic push with explicit
+#      refspecs, guarded by a lease that both refs are still absent, so it
+#      can never overwrite an origin someone seeded meanwhile.
+# No hand-typed push to main is ever needed (friction ledger FP-16).
+#
+# Usage:
+#   bootstrap-offgrid [--remote NAME] [--dry-run]
+#   bootstrap-offgrid -h | --help
+#
+# Exit codes:
+#   0  origin seeded with main and dev, off-grid (or dry run, or help)
+#   1  commit or push failed
+#   2  not a git repo, no namespace, no such remote, or origin already
+#      has main or dev
+
+set -euo pipefail
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit "${1:-0}"; }
+
+REMOTE=origin DRY=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remote) REMOTE="${2:?}"; shift 2 ;;
+    --dry-run) DRY=true; shift ;;
+    -h|--help) usage 0 ;;
+    *) echo "X bootstrap-offgrid: unknown argument $1" >&2; usage 2 ;;
+  esac
+done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "X bootstrap-offgrid: not inside a git repo" >&2; exit 2; }
+cd "$REPO_ROOT"
+NS=.io.v4rian.how-git
+[ -d "$NS" ] || { echo "X bootstrap-offgrid: no $NS namespace here; copy the template first" >&2; exit 2; }
+git remote get-url "$REMOTE" >/dev/null 2>&1 || { echo "X bootstrap-offgrid: no remote '$REMOTE'; add it first (git remote add $REMOTE <url>)" >&2; exit 2; }
+
+# shellcheck source=../scripts/_lib.sh
+. "$NS/scripts/_lib.sh"
+
+ADV=$(GIT_TERMINAL_PROMPT=0 git ls-remote "$REMOTE" refs/heads/main refs/heads/dev </dev/null) \
+  || { echo "X bootstrap-offgrid: cannot read '$REMOTE'" >&2; exit 2; }
+if [ -n "$ADV" ]; then
+  echo "X bootstrap-offgrid: '$REMOTE' already has $(printf '%s\n' "$ADV" | awk '{sub("refs/heads/","",$2); print $2}' | tr '\n' ' ')- bootstrap runs once on an empty origin." >&2
+  echo "  Work lands through pools: .io.v4rian.how-git/bin/create-pool-branch" >&2
+  exit 2
+fi
+
+if $DRY; then
+  echo "[dry-run] heal hooks; commit the namespace on main if the repo has no commit; set-mode off-grid;"
+  echo "[dry-run] git push --atomic --force-with-lease=refs/heads/main: --force-with-lease=refs/heads/dev: $REMOTE refs/heads/main refs/heads/dev"
+  exit 0
+fi
+
+bash "$NS/scripts/heal.sh" >/dev/null
+
+if ! git rev-parse -q --verify HEAD >/dev/null; then
+  git symbolic-ref HEAD refs/heads/main
+  git add -- "$NS"
+  [ -e .gitignore ] && git add -- .gitignore
+  [ -d .github ] && git add -- .github
+  git commit -q -m "[NEW] Bootstrap the how-git framework" \
+    -m "Seeds the repo with the how-git namespace, its hooks and tools, so every later change lands through allocated pools." \
+    || { echo "X bootstrap-offgrid: bootstrap commit failed" >&2; exit 1; }
+fi
+[ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] \
+  || { echo "X bootstrap-offgrid: HEAD is '$(git rev-parse --abbrev-ref HEAD)'; run it on main" >&2; exit 2; }
+
+"$NS/bin/set-mode" off-grid
+git branch -f dev main
+
+if ! git push -q --atomic \
+    --force-with-lease=refs/heads/main: --force-with-lease=refs/heads/dev: \
+    "$REMOTE" refs/heads/main:refs/heads/main refs/heads/dev:refs/heads/dev; then
+  echo "X bootstrap-offgrid: publishing main and dev to '$REMOTE' failed; nothing was half-pushed (atomic)" >&2
+  exit 1
+fi
+git branch -q --set-upstream-to="$REMOTE/main" main 2>/dev/null || true
+git branch -q --set-upstream-to="$REMOTE/dev" dev 2>/dev/null || true
+echo "-> '$REMOTE' seeded: main and dev at $(git rev-parse --short main), mode off-grid"
+echo "   next: git checkout dev && .io.v4rian.how-git/bin/create-pool-branch <kind> <slug>"

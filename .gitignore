@@ -1,0 +1,42 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code session state (worktrees, transcripts, etc.)
+.claude/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+dist/
+build/
+*.log
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Language-specific (extend as needed for your project)
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+target/
+
+# VERSION file is NEVER tracked. Tags are the canonical version state
+# (seal of approval at the tagged commit). The `version` bin computes
+# runtime / pre-merge identifiers from the latest reachable tag + HEAD
+# SHA + local build counter; see .io.v4rian.how-git/bin/version.
+/VERSION
+
+# Per-developer local build counter - bumped by `version --build`,
+# never shared across machines. Each clone tracks its own build IDs.
+/version.build

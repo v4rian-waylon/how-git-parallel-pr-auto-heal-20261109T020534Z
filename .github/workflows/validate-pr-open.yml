@@ -1,0 +1,72 @@
+name: validate-pr-open
+
+# Thin dispatcher around .io.v4rian.how-git/scripts/validate-pr-open.sh.
+#
+# Fires on every pull_request opened, edited, or synchronize event
+# targeting dev or main. The canonical script handles shielding (source
+# branch shape + actor admin check), title amendment (auto-derived from
+# branch name and bin/version), body amendment (shared auto-fix library
+# pass plus workflow signature), and posting the
+# opened-via-correct-flow commit status check that the dev branch
+# ruleset will require before merge.
+#
+# Server-side authority: this workflow is the SINGLE entry point that
+# can stamp opened-via-correct-flow as green on a PR commit. Local
+# tooling (bin/init-pool-merge and bin/init-release) opens the PR
+# through the same gh pr create surface the GitHub UI uses, then waits
+# for this workflow to run. There is no separate path that bypasses
+# the validator.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+    branches:
+      - dev
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+# Serialize per-PR so a fast follow-up edit doesn't race the prior run
+# while it's still amending.
+concurrency:
+  group: validate-pr-open-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Run the canonical validator
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_ACTOR: ${{ github.event.pull_request.user.login }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -uo pipefail
+          bash .io.v4rian.how-git/scripts/validate-pr-open.sh
+          rc=$?
+          echo "validate-pr-open script exited rc=$rc"
+          # rc=2 means the PR was closed for a rule violation; that is a
+          # legitimate workflow outcome, not a failure of the dispatcher.
+          # The status check was posted red by the script itself; the
+          # workflow exits 0 so it doesn't show up as a separate red
+          # workflow failure on the PR.
+          if [ "$rc" -eq 2 ]; then
+            exit 0
+          fi
+          exit "$rc"

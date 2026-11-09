@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# sync-pools - rebase local, never-pushed pool branches onto dev.
+#
+# scripts/auto-rebase-pools-after-dev-merge.sh reconciles pool branches
+# that live on origin. Pool branches that exist only locally (no
+# refs/remotes/origin/<branch>) are this tool's subject: each one that
+# does not already contain dev is rebased onto it.
+#
+# Before touching a branch the tool takes a preflight snapshot of its tip
+# as a local Pattern-2 safety ref, safety/<branch>-<YYYYMMDD-HHMMSS>, so
+# the old history is always one `git branch -f` away (bin/gc-safety
+# collects the snapshot once the pool is merged and vaulted).
+#
+# Stacked pools move as one stack: a pool whose tip another candidate
+# contains is not rebased on its own; the upper pool's rebase carries it
+# with git rebase --update-refs, so the stack keeps one copy of each commit.
+# Only candidate pool refs are updated that way (the todo list's other
+# update-ref lines, preflight snapshots included, are dropped).
+#
+# The first conflict stops the sweep with the rebase left in progress and
+# prints the exact commands to finish it, abort it or restore the branch.
+# Branches checked out in another worktree are skipped with a note. The
+# tree must be clean; the starting branch is checked out again at the end.
+# Hooks are off for the rebase checkouts: no new commit is authored, and
+# the post-checkout audit would run once per branch.
+#
+# Usage:
+#   sync-pools                 rebase every unpushed pool branch onto dev
+#   sync-pools --onto <ref>    rebase onto <ref> instead of dev
+#   sync-pools --dry-run       list what would be rebased, change nothing
+#   sync-pools -h|--help       print this help
+#
+# Exit codes:
+#   0  every unpushed pool rebased (or nothing to do, --dry-run, help)
+#   1  a rebase stopped on a conflict; continue, abort and restore commands printed
+#   2  bad flag or --onto ref, not a git repo, dirty tree, or a rebase already in progress
+
+set -euo pipefail
+
+usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+ONTO=dev
+DRY_RUN=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --onto) ONTO="${2:-}"; [ -n "$ONTO" ] || { echo "X sync-pools: --onto needs a ref" >&2; exit 2; }; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "X sync-pools: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -n "$REPO_ROOT" ] || { echo "X sync-pools: not inside a git repo" >&2; exit 2; }
+cd "$REPO_ROOT"
+
+git rev-parse -q --verify "$ONTO^{commit}" >/dev/null \
+  || { echo "X sync-pools: '$ONTO' is not a commit" >&2; exit 2; }
+if [ -n "$(git status --porcelain)" ]; then
+  echo "X sync-pools: working tree dirty; commit or stash first" >&2
+  git status --short >&2
+  exit 2
+fi
+if [ -d "$(git rev-parse --git-path rebase-merge)" ] || [ -d "$(git rev-parse --git-path rebase-apply)" ]; then
+  echo "X sync-pools: a rebase is already in progress; finish it first (git rebase --continue or --abort)" >&2
+  exit 2
+fi
+
+START=$(git symbolic-ref -q --short HEAD || git rev-parse HEAD)
+# Branches checked out in any other worktree cannot be rebased from here.
+BUSY=$(git worktree list --porcelain | sed -n 's#^branch refs/heads/##p')
+STAMP=$(date +%Y%m%d-%H%M%S)
+
+CANDS=()
+while read -r b; do
+  [ -n "$b" ] || continue
+  if git show-ref -q --verify "refs/remotes/origin/$b"; then
+    continue
+  fi
+  if git merge-base --is-ancestor "$ONTO" "refs/heads/$b"; then
+    echo "  up to date $b"; continue
+  fi
+  if [ "$b" != "$START" ] && printf '%s\n' "$BUSY" | grep -qxF "$b"; then
+    echo "  skip $b (checked out in another worktree; run sync-pools there)"; continue
+  fi
+  CANDS+=("$b")
+done <<EOF
+$(git for-each-ref --format='%(refname:short)' 'refs/heads/pool/')
+EOF
+
+# A candidate another candidate contains rides that one's rebase.
+upper_of() {
+  local c
+  for c in ${CANDS[@]+"${CANDS[@]}"}; do
+    [ "$c" = "$1" ] && continue
+    if git merge-base --is-ancestor "refs/heads/$1" "refs/heads/$c"; then
+      printf '%s' "$c"; return 0
+    fi
+  done
+  return 1
+}
+
+TOPS=()
+for b in ${CANDS[@]+"${CANDS[@]}"}; do
+  snap="safety/$b-$STAMP"
+  if up=$(upper_of "$b"); then
+    $DRY_RUN && { echo "  would rebase $b onto $ONTO with the stack under $up (preflight $snap)"; continue; }
+  else
+    TOPS+=("$b")
+    $DRY_RUN && { echo "  would rebase $b onto $ONTO (preflight $snap)"; continue; }
+  fi
+  git update-ref "refs/heads/$snap" "refs/heads/$b" ""
+  echo "  preflight $snap -> $(git rev-parse --short "refs/heads/$b")"
+done
+
+# The todo filter keeps the update-ref lines of candidate pools only.
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/sync-pools.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+printf 'refs/heads/%s\n' ${CANDS[@]+"${CANDS[@]}"} > "$TMP/cands"
+cat > "$TMP/todo-filter" <<'FILTER'
+#!/bin/sh
+awk -v keep="$SYNC_POOLS_CANDS" '
+  BEGIN { while ((getline l < keep) > 0) ok[l] = 1 }
+  $1 == "update-ref" && !($2 in ok) { next }
+  { print }' "$1" > "$1.sync-pools" && mv "$1.sync-pools" "$1"
+FILTER
+chmod +x "$TMP/todo-filter"
+
+DONE=()
+for b in ${TOPS[@]+"${TOPS[@]}"}; do
+  $DRY_RUN && break
+  if ! SYNC_POOLS_CANDS="$TMP/cands" GIT_SEQUENCE_EDITOR="$TMP/todo-filter" \
+       git -c core.hooksPath=/dev/null rebase -q -i --update-refs --empty=drop "$ONTO" "$b" >/dev/null 2>&1; then
+    echo "X sync-pools: conflict rebasing $b onto $ONTO; the rebase is left in progress." >&2
+    echo "  conflicted paths:" >&2
+    git diff --name-only --diff-filter=U | sed 's/^/    /' >&2
+    echo "  finish:  edit the paths above, git add <path>..., then git rebase --continue" >&2
+    echo "  abort:   git rebase --abort && git checkout $START" >&2
+    echo "  restore: git branch -f $b safety/$b-$STAMP   (after the abort, if the branch moved)" >&2
+    echo "  then re-run bin/sync-pools for the remaining branches" >&2
+    exit 1
+  fi
+  for c in ${CANDS[@]+"${CANDS[@]}"}; do
+    git merge-base --is-ancestor "refs/heads/$c" "refs/heads/$b" || continue
+    DONE+=("$c")
+    echo "  rebased $c onto $ONTO"
+  done
+done
+
+if [ "$(git symbolic-ref -q --short HEAD || git rev-parse HEAD)" != "$START" ]; then
+  git -c core.hooksPath=/dev/null checkout -q "$START"
+fi
+echo "ok: ${#DONE[@]} pool branch(es) rebased onto $ONTO"

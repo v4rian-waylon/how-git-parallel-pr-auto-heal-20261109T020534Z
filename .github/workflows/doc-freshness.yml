@@ -1,0 +1,63 @@
+name: doc-freshness
+
+# Thin dispatcher around .io.v4rian.how-git/scripts/workflows/doc-freshness-check.sh.
+#
+# Fires on every pull_request opened, edited, reopened, or synchronize
+# event targeting main (the dev → main release PR). The canonical
+# script extracts the dev → main diff substance and compares it
+# against the user-facing docs (CHANGELOG, RUNBOOK, CONTRIBUTING, root
+# README, namespace README). When the docs lag, the script posts a red
+# doc-freshness status check listing the stale docs and the missing
+# substance axes; bootstrap-ci binds doc-freshness as a required check
+# on PRs into main so the release cannot land until either the docs
+# are refreshed manually or (in a follow-up that wires the worker apply
+# path) the claude worker stub does the rewrite automatically.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+# Serialize per-PR so a fast follow-up edit doesn't race the prior run
+# while it's still posting status.
+concurrency:
+  group: doc-freshness-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch origin/main so the diff can resolve
+        run: |
+          git fetch origin main:refs/remotes/origin/main || true
+          git fetch origin dev:refs/remotes/origin/dev || true
+
+      - name: Run the canonical doc-freshness check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_ACTOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -uo pipefail
+          bash .io.v4rian.how-git/scripts/workflows/doc-freshness-check.sh
+          rc=$?
+          echo "doc-freshness script exited rc=$rc"
+          exit "$rc"

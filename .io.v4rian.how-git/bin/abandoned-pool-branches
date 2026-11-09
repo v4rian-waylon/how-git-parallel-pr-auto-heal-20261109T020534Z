@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# abandoned-pool-branches - operator-run wrapper for the abandoned-pool-
+# branches institutional-memory reporter.
+#
+# Thin shim that locates the canonical script under scripts/ and forwards
+# every argument verbatim. Matches the bin/ vs scripts/ split the rest of
+# the framework uses: bin/ entries are the operator surface, scripts/ is
+# the implementation. Updating the script body never requires editing
+# this wrapper; updating the wrapper never requires editing the script
+# body.
+#
+# This wrapper exists so an operator at the repo root can type:
+#
+#   .io.v4rian.how-git/bin/abandoned-pool-branches --help
+#   .io.v4rian.how-git/bin/abandoned-pool-branches
+#   .io.v4rian.how-git/bin/abandoned-pool-branches --days 7
+#   .io.v4rian.how-git/bin/abandoned-pool-branches --json
+#
+# instead of remembering the scripts/ path. See the wrapped script's
+# --help for the full flag list, the output shape, and the exit codes.
+#
+# READ-ONLY: this tool emits an institutional-memory report listing pool
+# branches that look abandoned. It NEVER deletes, archives, or otherwise
+# mutates any ref. Per feedback_safety_anchors_stay_forever, safety
+# anchors stay forever regardless of their paired pool branch's fate;
+# the operator decides what (if anything) to do about a candidate pool.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+SCRIPT="$NS_DIR/scripts/abandoned-pool-branches.sh"
+
+if [ ! -x "$SCRIPT" ]; then
+  echo "X abandoned-pool-branches: canonical script missing or not executable at $SCRIPT" >&2
+  exit 1
+fi
+
+exec bash "$SCRIPT" "$@"

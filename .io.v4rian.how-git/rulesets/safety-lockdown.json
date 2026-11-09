@@ -1,0 +1,33 @@
+{
+  "_comment": "v4rian safety/* full lockdown. Pins safety/* creation to the allocator workflow's identity so only the atomic pool/safety pair allocation can mint a safety ref. update and deletion are blocked everywhere so under the stay-forever rule every anchor SHA is immutable for the life of the branch and no operator, workflow, or claim ceremony can ever drop a safety/ ref. Combined with the pool-creations ruleset this blocks the rename-equals-delete-plus-create attack vector for developers entirely. The include patterns cover both layouts: legacy flat refs/heads/safety/<suffix> and prefixed refs/heads/safety/<vYYYY.MAIN>/<suffix> from any historical anchor still on the repo. Apply via .io.v4rian.how-git/scripts/apply-repo-rules.sh or bin/lockdown. The ACTOR_ID placeholder is substituted at apply time with the integration id of the GitHub Actions bot on the target repo (gh api /orgs/{org}/installations --jq '.installations[] | select(.app_slug==\"github-actions\") | .id'). Bypass actors: repository admins only; privileged transitions run locally under the admin operator's own gh session (bin/post-merge-lifecycle). Apply via .io.v4rian.how-git/scripts/apply-repo-rules.sh.",
+  "name": "v4rian-safety-lockdown",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/heads/safety/*",
+        "refs/heads/safety/*/*"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "creation"
+    },
+    {
+      "type": "update"
+    },
+    {
+      "type": "deletion"
+    }
+  ],
+  "bypass_actors": [
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
+    }
+  ]
+}

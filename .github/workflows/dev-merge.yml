@@ -1,0 +1,59 @@
+name: dev-merge
+
+# Thin admin-only entry: re-runs the dev claim (version tag on the merge
+# commit, merge message shape, pool branch archived to its vault ref)
+# when the automatic run did not complete.
+#
+# It owns no logic. The automatic claim is ci-dispatch.yml's pr-merge-dev
+# trigger (every push to dev); this file calls that same workflow with
+# trigger=pr-merge-dev on dev, which runs ci/audits/pr-merge-dev/
+# required.claim.sh -> scripts/workflows/claim-retry.sh --target dev. The
+# claim is idempotent: a merge already sealed by its tag resumes or exits
+# clean. No event trigger, so a dev push never claims twice.
+#
+# Off-grid twin: .io.v4rian.how-git/bin/ci-local --workflow dev-merge
+
+on:
+  workflow_dispatch:
+
+# Permissions: exactly ci-dispatch.yml's set. GitHub never elevates
+# permissions down a call chain, so the caller must grant what the called
+# workflow requests; the admin gate and ci-dispatch's ref validator are
+# what keep this token away from untrusted code. The set sits at workflow
+# level, which GitHub applies to every job including the calling one (its
+# docs give a called workflow the default token only when the calling job
+# has no permissions at all).
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  checks: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  admin:
+    name: verify actor is repo admin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: verify actor is repo admin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: bash .io.v4rian.how-git/scripts/workflows/verify-actor-admin.sh
+
+  claim:
+    needs: admin
+    uses: ./.github/workflows/ci-dispatch.yml
+    with:
+      trigger: pr-merge-dev
+      ref: dev
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CI_BOT_APP_PRIVATE_KEY: ${{ secrets.CI_BOT_APP_PRIVATE_KEY }}

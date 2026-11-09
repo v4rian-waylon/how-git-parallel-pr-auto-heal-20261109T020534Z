@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""bench - measure how efficiently an agent executes the how-git protocol.
+
+Runs scripted git tasks on throwaway off-grid consumer repos, once per arm x model x
+task x rep, in a sandbox that loads only the arm's loader and framework, then scores
+each run with deterministic checkers and Claude Code's own token accounting.
+
+  bench run   [--arms how-git,neo-git] [--models opus,fable] [--tasks a,b,...] [--reps N]
+              [--max-turns N] [--max-budget-usd X] [--dry] [--jobs N] [--out DIR]
+              [--arm NAME=LOADER:REF ...] [--effort LEVEL] [--nested-model ID]
+  bench summary RESULTS.jsonl
+  bench diff    A.jsonl B.jsonl            compare two result sets (% deltas per model x task)
+  bench diff    RESULTS.jsonl --arms how-git,neo-git   compare two arms inside one set
+  bench check   RUN_DIR                    re-run the deterministic checkers on a finished run
+  bench isolation [--model ID]             one probe session proving what a benchmark agent sees
+  bench selftest [ARM]                     known-bad solutions must trip the named checks
+  bench tasks                              list tasks
+  bench export --out DIR [--arms how-git,neo-git] [--tasks a,b,...] [--rep N]
+                                           agent-runner mode: build every run dir as `run` would and
+                                           write RUN/AGENT_PROMPT.md for an external agent (no model call)
+  bench ingest RUN_DIR --tokens N --tool-uses N --duration-ms N --model ID
+              [--input-tokens N --output-tokens N --cache-read-tokens N --cache-write-tokens N]
+              [--results FILE]             check an exported run and append its results.jsonl row
+  bench loadbytes [--old-ref 5028b58] [--new-ref HEAD] [--old-loader PATH] [--memory-dir DIR] [--out FILE]
+                                           zero-model bytes each arm tells an agent to read, per task
+
+Arms: arms/<name>.conf (ref, bundle, loader). Tasks: tasks/<id>/{prompt.md,setup.sh,
+reference.sh,check.py}. --dry builds every fixture, runs each task's reference solution
+instead of a model and requires every checker to pass: it validates the harness for free.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from benchcore import checks, core, report  # noqa: E402
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = (argv[0], argv[1:]) if argv[0] in ("run", "summary", "diff", "check", "isolation", "tasks", "selftest", "loadbytes", "export", "ingest") \
+        else ("run", argv)
+    if cmd == "run":
+        p = argparse.ArgumentParser(prog="bench run")
+        p.add_argument("--arms", default="how-git,neo-git")
+        p.add_argument("--arm", action="append", default=[], help="extra arm NAME=LOADER:REF")
+        p.add_argument("--models", default="opus,fable", help="aliases opus,fable,haiku or full model ids")
+        p.add_argument("--tasks", default="", help="comma list of task ids or letters (default all)")
+        p.add_argument("--reps", type=int, default=1)
+        p.add_argument("--max-turns", type=int, default=60, help="per-run turn cap (budget control)")
+        p.add_argument("--max-budget-usd", type=float, default=None, help="per-run $ cap passed to the CLI")
+        p.add_argument("--timeout", type=int, default=1800, help="per-run wall clock cap in seconds")
+        p.add_argument("--effort", default=None)
+        p.add_argument("--disallow", default="ScheduleWakeup,CronCreate,CronDelete,CronList,PushNotification,RemoteTrigger",
+                       help="tools denied to benchmark agents (headless sessions cannot be woken; '' to allow all)")
+        p.add_argument("--nested-model", default=None, help="model for hook-spawned claude calls (default: run model)")
+        p.add_argument("--jobs", type=int, default=1)
+        p.add_argument("--dry", action="store_true", help="no model: reference solutions through every checker")
+        p.add_argument("--out", default=None)
+        p.add_argument("--framework-repo", default=None)
+        o = p.parse_args(rest)
+        if o.arm:
+            o.arms = ",".join([a for a in o.arms.split(",") if a] + o.arm)
+        return core.run_matrix(o)
+    if cmd == "summary":
+        print(report.summary_markdown(report.load(rest[0])))
+        return 0
+    if cmd == "diff":
+        p = argparse.ArgumentParser(prog="bench diff")
+        p.add_argument("files", nargs="+")
+        p.add_argument("--arms", default=None)
+        o = p.parse_args(rest)
+        if len(o.files) == 2:
+            print(report.diff_markdown(report.load(o.files[0]), report.load(o.files[1]),
+                                       os.path.basename(o.files[0]), os.path.basename(o.files[1])))
+        else:
+            a, b = (o.arms or "how-git,neo-git").split(",")
+            rows = report.load(o.files[0])
+            print(report.diff_markdown([r for r in rows if r["arm"] == a], [r for r in rows if r["arm"] == b], a, b))
+        return 0
+    if cmd == "check":
+        run = os.path.abspath(rest[0])
+        task = open(os.path.join(run, "TASK")).read().strip()
+        v = checks.run_task_checks(run, os.path.join(core.TASKS, task))
+        for c in v["checks"]:
+            print("[%s] %-10s %-28s %s" % ("x" if c["ok"] else " ", c["kind"], c["id"], c["detail"]))
+        print("success=%s compliance=%s/%s dataloss_ok=%s readability=%s" % (
+            v["success"], v["compliance_pass"], v["compliance_total"], v["dataloss_ok"], v["readability"]))
+        return 0 if v["success"] else 1
+    if cmd == "isolation":
+        from benchcore import isolation
+        p = argparse.ArgumentParser(prog="bench isolation")
+        p.add_argument("--model", default="claude-haiku-5-5")
+        p.add_argument("--arm", default="how-git")
+        o = p.parse_args(rest)
+        return isolation.probe(o)
+    if cmd == "loadbytes":
+        from benchcore import loadbytes
+        p = argparse.ArgumentParser(prog="bench loadbytes")
+        p.add_argument("--old-ref", default="5028b58", help="framework ref of the old arm (the fork point)")
+        p.add_argument("--new-ref", default="HEAD", help="framework ref carrying the in-repo lean loader")
+        p.add_argument("--old-loader", default=loadbytes.OLD_LOADER, help="the old arm's loader (default: the frozen bundle snapshot)")
+        p.add_argument("--memory-dir", default=None, help="where the old arm's mandated memories are read (default: the live memory store; missing = 0 B)")
+        p.add_argument("--out", default=None, help="also write the markdown table here")
+        p.add_argument("--framework-repo", default=None)
+        o = p.parse_args(rest)
+        o.repo = o.framework_repo or core.framework_repo()
+        return loadbytes.run(o)
+    if cmd == "export":
+        from benchcore import agent
+        p = argparse.ArgumentParser(prog="bench export")
+        p.add_argument("--out", required=True)
+        p.add_argument("--arms", default="how-git,neo-git")
+        p.add_argument("--arm", action="append", default=[], help="extra arm NAME=LOADER:REF")
+        p.add_argument("--tasks", default="")
+        p.add_argument("--rep", type=int, default=1)
+        p.add_argument("--framework-repo", default=None)
+        o = p.parse_args(rest)
+        if o.arm:
+            o.arms = ",".join([a for a in o.arms.split(",") if a] + o.arm)
+        return agent.export(o)
+    if cmd == "ingest":
+        from benchcore import agent
+        p = argparse.ArgumentParser(prog="bench ingest")
+        p.add_argument("run")
+        p.add_argument("--tokens", type=int, required=True)
+        p.add_argument("--tool-uses", type=int, required=True)
+        p.add_argument("--duration-ms", type=int, required=True)
+        p.add_argument("--model", required=True, help="alias opus,fable,haiku or a full model id")
+        for k in ("--input-tokens", "--output-tokens", "--cache-read-tokens", "--cache-write-tokens"):
+            p.add_argument(k, type=int, default=None)
+        p.add_argument("--results", default=None, help="default: results.jsonl two levels above RUN_DIR")
+        return agent.ingest(p.parse_args(rest))
+    if cmd == "selftest":
+        return core.selftest(rest[0] if rest else "how-git")
+    if cmd == "tasks":
+        for t in core.task_dirs(""):
+            print("%-14s %s" % (t, open(os.path.join(core.TASKS, t, "prompt.md")).read().strip().splitlines()[0][:110]))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# reject-pr - close a PR as a rejection while its branch stays alive.
+#
+# A rejection is not a plain close: the author is told why, the record is
+# machine readable, and the source branch stays on origin so the author
+# pushes fixes to the same branch and reopens the PR. The tool posts a
+# structured "## REJECTION" comment and closes the PR with it in one call
+# (gh pr close without --delete-branch, so the branch is never touched).
+# GitHub notifies the PR author of the close and every --mention login.
+#
+# The comment carries a hidden record line that tooling can parse:
+#   <!-- rejection pr=<N> reviewer=<login> branch=<head> at=<UTC ISO> -->
+#
+# --block-merge also labels the PR "rejected" and posts a failure commit
+# status with context "rejection" on the head commit, so a reopen cannot
+# merge until a reviewer posts that context green again (or a later push
+# moves the head and the required checks run anew).
+#
+# Usage:
+#   reject-pr <pr#> --reason "<why>" [--mention <login>]... [--block-merge]
+#             [--repo OWNER/REPO] [--dry-run]
+#   reject-pr -h | --help
+#
+# Exit 0 on success, 2 on usage errors (missing number or reason, PR not
+# open), 3 when gh or a token is missing, other codes from gh.
+
+set -euo pipefail
+
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+PR=""; REASON=""; MENTIONS=""; BLOCK=false; REPO=""; DRY_RUN=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --reason)      [ $# -ge 2 ] || usage 2; REASON="$2"; shift 2 ;;
+    --mention)     [ $# -ge 2 ] || usage 2; MENTIONS="${MENTIONS} @${2#@}"; shift 2 ;;
+    --block-merge) BLOCK=true; shift ;;
+    --repo)        [ $# -ge 2 ] || usage 2; REPO="$2"; shift 2 ;;
+    --dry-run)     DRY_RUN=true; shift ;;
+    -h|--help)     usage 0 ;;
+    -*)            echo "X reject-pr: unknown flag: $1" >&2; usage 2 ;;
+    *)             [ -z "$PR" ] || usage 2; PR="${1#\#}"; shift ;;
+  esac
+done
+
+case "$PR" in ''|*[!0-9]*) echo "X reject-pr: a PR number is required" >&2; exit 2 ;; esac
+if [ -z "$(printf '%s' "$REASON" | tr -d '[:space:]')" ]; then
+  echo "X reject-pr: --reason is required; the author needs to know what to fix" >&2
+  exit 2
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "X reject-pr: gh CLI is required" >&2
+  exit 3
+fi
+if [ -z "${GH_TOKEN:-}" ] && ! gh auth token >/dev/null 2>&1; then
+  echo "X reject-pr: no GitHub token available (set GH_TOKEN or run 'gh auth login')" >&2
+  exit 3
+fi
+
+if [ -z "$REPO" ]; then
+  REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+  [ -n "$REPO" ] || { echo "X reject-pr: --repo not supplied and origin is not set" >&2; exit 2; }
+fi
+
+STATE=$(gh pr view "$PR" --repo "$REPO" --json state --jq '.state' 2>/dev/null || true)
+case "$STATE" in
+  open|OPEN) ;;
+  '') echo "X reject-pr: PR #$PR not found in $REPO" >&2; exit 2 ;;
+  *)  echo "X reject-pr: PR #$PR is $STATE, only an open PR can be rejected" >&2; exit 2 ;;
+esac
+HEAD_REF=$(gh pr view "$PR" --repo "$REPO" --json headRefName --jq '.headRefName' 2>/dev/null || true)
+REVIEWER=$(gh api user --jq '.login' 2>/dev/null || true)
+[ -n "$REVIEWER" ] || REVIEWER="unknown"
+AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+COMMENT="## REJECTION
+
+Reason: ${REASON}
+Reviewer: @${REVIEWER}
+Branch: ${HEAD_REF:-unknown} (kept on origin: push fixes to it and reopen this PR)"
+if [ -n "$MENTIONS" ]; then
+  COMMENT="${COMMENT}
+Notify:${MENTIONS}"
+fi
+if $BLOCK; then
+  COMMENT="${COMMENT}
+Merge block: a failing rejection status stays on the head until a reviewer clears it."
+fi
+COMMENT="${COMMENT}
+
+<!-- rejection pr=${PR} reviewer=${REVIEWER} branch=${HEAD_REF:-unknown} at=${AT} -->"
+
+if $DRY_RUN; then
+  echo "[dry-run] would close PR #$PR in $REPO, keeping ${HEAD_REF:-its branch}, with:"
+  printf '%s\n' "$COMMENT"
+  exit 0
+fi
+
+gh pr close "$PR" --repo "$REPO" --comment "$COMMENT" >/dev/null
+echo "ok rejected PR #$PR in $REPO; branch ${HEAD_REF:-unknown} kept on origin"
+
+if $BLOCK; then
+  gh pr edit "$PR" --repo "$REPO" --add-label rejected >/dev/null 2>&1 \
+    || echo "  ! could not add the rejected label (does the label exist?)" >&2
+  HEAD_SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+  if [ -n "$HEAD_SHA" ]; then
+    gh api -X POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+      -f "state=failure" -f "context=rejection" \
+      -f "description=rejected by ${REVIEWER}; a reviewer clears this before merge" --silent
+    echo "  ok rejection status posted on ${HEAD_SHA}"
+  else
+    echo "  ! head commit not resolvable; rejection status not posted" >&2
+  fi
+fi

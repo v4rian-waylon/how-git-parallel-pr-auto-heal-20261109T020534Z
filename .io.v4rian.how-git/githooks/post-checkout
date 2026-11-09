@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# post-checkout - branch-name warning + an opt-in run of the in-repo
+# git-snapshot-preflight Claude skill on a working-branch checkout
+# (git config howgit.checkoutAudit true; off by default, rate-limited).
+#
+# Skipped on file-checkouts ($3 != 1) and on protected branches
+# (main, dev) where preflight isn't applicable.
+#
+# Framework-internal skill invocations are gated on the FRAMEWORK_REPO
+# marker. The git-snapshot-preflight skill is project-agnostic in spec
+# but its execution context (expecting `preflight-bak-YYYY-MM-DD` branches
+# from the bak-zip rebuild workflow) only exists on the how-git framework
+# source repo. Consumer repos do not host those branches; running the
+# skill there emits noisy `AUDIT_FAIL: no preflight-bak-YYYY-MM-DD branch
+# found on origin` lines on every checkout. The marker is the same source
+# of truth used by ci-dispatch, offline-test, and audits/coverage to gate
+# framework-internal behavior.
+
+prev=$1; new=$2; is_branch_checkout=$3
+[[ "$is_branch_checkout" == "1" ]] || exit 0
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+[[ "$branch" =~ ^(main|dev)$ ]] && exit 0
+# A detached checkout has no branch name to validate or preflight.
+[ "$branch" = "HEAD" ] && exit 0
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -z "$REPO_ROOT" ] && exit 0
+
+# The branch-name regex is the shared HG_BRANCH_RE from scripts/_lib.sh
+# (one definition for every hook and script). The source is cheap: _lib.sh
+# defines functions and constants only and runs nothing at source time.
+# shellcheck source=../scripts/_lib.sh
+. "$REPO_ROOT/.io.v4rian.how-git/scripts/_lib.sh"
+
+if ! hg_branch_name_ok "$branch"; then
+  echo "⚠  Branch '$branch' doesn't match the v4rian format."
+  echo "   Expected: $HG_BRANCH_FORMAT"
+  echo "   Fine for a local spike; the pre-push hook refuses to push it under this name."
+  # Still fall through - if the marker gate clears, the skill can decide what to do for spikes.
+fi
+
+# Framework-internal skill invocations are gated on FRAMEWORK_REPO marker
+# presence. Consumer repos (marker absent) skip cleanly and never see the
+# preflight skill fire. See the header docstring above for rationale.
+if [ ! -f "$REPO_ROOT/.io.v4rian.how-git/FRAMEWORK_REPO" ]; then
+  exit 0
+fi
+
+# The audit spawns a headless claude session, so it is off by default and
+# opt-in per clone: git config howgit.checkoutAudit true (or the env
+# HOW_GIT_CHECKOUT_AUDIT=1). A null previous HEAD (clone, git worktree add)
+# never spawns, and one branch is audited at most once per
+# howgit.checkoutAuditInterval seconds (default 3600) (friction ledger FP-04).
+audit_on="${HOW_GIT_CHECKOUT_AUDIT:-$(git config --get howgit.checkoutAudit 2>/dev/null || true)}"
+case "$audit_on" in 1|true|yes|on) ;; *) exit 0 ;; esac
+case "$prev" in ''|*[!0]*) ;; *) exit 0 ;; esac
+stamp_dir="$(git rev-parse --git-common-dir 2>/dev/null)/how-git/checkout-audit"
+stamp="$stamp_dir/$(printf '%s' "$branch" | tr '/' '_')"
+interval=$(git config --get howgit.checkoutAuditInterval 2>/dev/null || echo 3600)
+case "$interval" in ''|*[!0-9]*) interval=3600 ;; esac
+now=$(date +%s)
+if [ -f "$stamp" ] && [ $((now - $(cat "$stamp" 2>/dev/null || echo 0))) -lt "$interval" ]; then
+  exit 0
+fi
+mkdir -p "$stamp_dir" 2>/dev/null && echo "$now" > "$stamp" 2>/dev/null || true
+
+# Fetch the active-requirement for this branch so the preflight skill
+# can include the canonical intent in its prompt. Empty when the branch
+# predates this lifecycle step or was allocated without a requirement.
+ACTIVE_REQUIREMENT=""
+if [ -x "$REPO_ROOT/.io.v4rian.how-git/scripts/get-active-requirement.sh" ]; then
+  ACTIVE_REQUIREMENT=$(bash "$REPO_ROOT/.io.v4rian.how-git/scripts/get-active-requirement.sh" HEAD 2>/dev/null || true)
+fi
+REQ_HEADER=""
+if [ -n "$ACTIVE_REQUIREMENT" ]; then
+  REQ_HEADER="Active requirement for $branch (canonical intent stamped by the allocator at branch-out time): ${ACTIVE_REQUIREMENT}. "
+fi
+
+# Run preflight via the in-repo git-snapshot-preflight skill.
+# Note: we don't propagate failure here - a half-checked-out state
+# from a blocked post-checkout is worse than missing a preflight. The
+# skill should warn loudly but not block the checkout itself.
+claude_skill_run git-snapshot-preflight "${REQ_HEADER}post-checkout firing on branch=$branch (prev=$prev new=$new); make sure the safety/ anchor and offsite backup exist before any work begins" || true

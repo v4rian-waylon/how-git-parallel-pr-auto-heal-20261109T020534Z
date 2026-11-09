@@ -1,0 +1,70 @@
+name: seed-dev-on-main-create
+
+# Rarely-firing fallback that seeds `dev` at main's SHA when the operator
+# (or an automation) pushes a NEW `main` branch ref after repo creation.
+# Documented fallback only; the canonical dev-seeding path on a freshly
+# templated consumer is `bin/bootstrap-ci`, whose Step 2 reads main's SHA
+# via the API and POSTs `refs/heads/dev` at the same commit.
+#
+# Why this workflow does NOT fire on the GitHub "Use this template" path
+# (the dominant case it was originally wired for):
+#   GitHub does not emit a `create` event for refs that exist at the
+#   moment of repo birth. `POST /repos/{template}/generate` populates
+#   `main` atomically as part of repo creation, so the `create` event
+#   never fires for the initial `main` ref. Consequence: a consumer
+#   created via the "Use this template" button does NOT get `dev`
+#   seeded by this workflow; the operator must run `bin/bootstrap-ci`
+#   to seed it (and apply branch protection, Repository Rules, and the
+#   rest of the repo-level setup the template button does not copy).
+#
+# The workflow's logic is intentionally narrow:
+#   - Fires on `create` for the `main` ref only.
+#   - No-op if `dev` already exists on origin (e.g. a downstream consumer
+#     pushed it themselves, or `bootstrap-ci` already ran).
+#   - Pushes `refs/heads/dev` at the current main SHA otherwise.
+#
+# This complements `bin/bootstrap-ci`'s canonical Step 2 dev-seed and
+# `scripts/heal.sh`'s repair-style dev-seeding step: `bootstrap-ci` is
+# the documented setup path that handles the template-generate case
+# correctly, `heal.sh` fixes drift if dev went missing post-bootstrap,
+# and this workflow covers the narrow case where main appears as a
+# genuine post-birth push.
+#
+# Like all `on: create` workflows, this file must live on the repo's
+# default branch (main) to fire at all; the `create` event reads only
+# from the default branch.
+
+on:
+  create
+
+permissions:
+  contents: write
+
+jobs:
+  seed:
+    if: ${{ github.event.ref_type == 'branch' && github.event.ref == 'main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (need write token)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity for the bot push
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Seed dev at main's SHA (if not already on origin)
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --heads origin dev | grep -q 'refs/heads/dev$'; then
+            echo "→ dev already exists on origin; no-op"
+            exit 0
+          fi
+          echo "→ seeding dev at $SHA (paired with main at repo birth)"
+          git push origin "$SHA:refs/heads/dev"
+          echo "✓ dev created at $SHA"

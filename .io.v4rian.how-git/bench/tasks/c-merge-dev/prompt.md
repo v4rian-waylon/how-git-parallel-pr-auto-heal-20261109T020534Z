@@ -1,0 +1,1 @@
+The working branch `{{POOL}}` is finished: its commits are reviewed and its artifact has been run and approved. You are pre-authorised to merge it to dev now. Merge it into dev and complete the off-grid close-up per the protocol. Do not touch main.

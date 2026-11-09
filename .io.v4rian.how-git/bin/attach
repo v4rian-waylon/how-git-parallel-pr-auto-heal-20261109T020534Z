@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# attach - operator-run wrapper for the mid-life adoption pass.
+#
+# Thin shim that locates the canonical script under scripts/ and forwards
+# every argument verbatim, matching the bin/ vs scripts/ split the rest
+# of the framework uses. Run it FROM a framework checkout (this checkout
+# is the source); the script vendors the framework into the target repo.
+#
+#   .io.v4rian.how-git/bin/attach --help
+#   .io.v4rian.how-git/bin/attach <target-repo-path> --dry-run
+#   .io.v4rian.how-git/bin/attach <target-repo-path>
+set -euo pipefail
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec bash "$SCRIPT_DIR/../scripts/attach.sh" "$@"

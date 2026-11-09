@@ -1,0 +1,30 @@
+{
+  "_comment": "v4rian pool/* creation restriction. Pins pool/* ref creation to the allocator flow; developers never create pool refs. The pool/*.reconcile.* name shape is carved OUT of the lock so the CI claim publishes rebase candidates with its plain workflow token - candidates are frozen receipts the provenance audit flags when an unexpected actor creates one. Deletion lives in the separate pool-deletions ruleset. Bypass actors: repository admins only. Apply via .io.v4rian.how-git/scripts/apply-repo-rules.sh.",
+  "name": "v4rian-pool-creations",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/heads/pool/*",
+        "refs/heads/pool/*/*"
+      ],
+      "exclude": [
+        "refs/heads/pool/*.reconcile.*",
+        "refs/heads/pool/*/*.reconcile.*"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "creation"
+    }
+  ],
+  "bypass_actors": [
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
+    }
+  ]
+}

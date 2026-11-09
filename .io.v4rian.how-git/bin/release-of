@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# release-of - find which release tag contains a given commit.
+#
+# Walks the tags on main's first-parent line, finds the earliest one
+# whose ancestor set includes the given commit SHA. That's the release
+# the commit shipped under.
+#
+# If the commit is on dev but not yet released (no main merge contains
+# it), reports "unreleased".
+#
+# Usage:
+#   release-of <commit-sha>      find the release tag containing X
+#   release-of HEAD              shorthand for current HEAD
+#   release-of -h|--help         print this help
+#
+# Read-only. Needs a main or origin/main ref; considers only v* tags on
+# main's line.
+#
+# Exit codes:
+#   0  release tag (or "unreleased ...") printed, or help (also printed when
+#      no argument is given)
+#   2  not a git repo, the argument does not resolve to a commit, or no main
+#      branch exists
+
+set -euo pipefail
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0; }
+
+for _arg in "$@"; do case "$_arg" in -h|--help) usage ;; esac; done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X release-of: not inside a git repo" >&2
+  exit 2
+fi
+
+if [ $# -eq 0 ]; then usage; fi
+case "$1" in
+  -h|--help) usage ;;
+esac
+TARGET="$1"
+
+cd "$REPO_ROOT"
+
+# Resolve the SHA
+RESOLVED=$(git rev-parse --verify --quiet "$TARGET" 2>/dev/null || true)
+if [ -z "$RESOLVED" ]; then
+  echo "X cannot resolve '$TARGET' to a commit" >&2
+  exit 2
+fi
+
+# Check main reachability
+if git rev-parse --verify --quiet main >/dev/null 2>&1; then
+  MAIN_REF=main
+elif git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+  MAIN_REF=origin/main
+else
+  echo "X no main branch found" >&2
+  exit 2
+fi
+
+if ! git merge-base --is-ancestor "$RESOLVED" "$MAIN_REF" 2>/dev/null; then
+  echo "unreleased ($TARGET not reachable from $MAIN_REF)"
+  exit 0
+fi
+
+# Two semantics combined:
+#  A) EARLIEST_CONTAINING: earliest release tag whose ancestor set includes
+#     the commit (commit was there when the tag was made - "first release
+#     to ship this commit").
+#  B) LATEST_REACHABLE: latest release tag reachable from the commit (the
+#     commit is AT or AFTER the tag - for dev->main merge commits which
+#     are newer than the dev tag they brought in).
+# A wins when available; B is the fallback for "commit is on main but
+# postdates any tag" (e.g., the dev->main merge commit itself).
+EARLIEST_CONTAINING=""
+LATEST_REACHABLE=""
+for tag in $(git tag -l 'v*' --sort=creatordate); do
+  TAG_SHA=$(git rev-parse "$tag^{commit}" 2>/dev/null || true)
+  [ -z "$TAG_SHA" ] && continue
+  if ! git merge-base --is-ancestor "$TAG_SHA" "$MAIN_REF" 2>/dev/null; then
+    continue
+  fi
+  if [ -z "$EARLIEST_CONTAINING" ] && git merge-base --is-ancestor "$RESOLVED" "$TAG_SHA" 2>/dev/null; then
+    EARLIEST_CONTAINING="$tag"
+  fi
+  if git merge-base --is-ancestor "$TAG_SHA" "$RESOLVED" 2>/dev/null; then
+    LATEST_REACHABLE="$tag"
+  fi
+done
+
+if [ -n "$EARLIEST_CONTAINING" ]; then
+  echo "$EARLIEST_CONTAINING"
+elif [ -n "$LATEST_REACHABLE" ]; then
+  echo "$LATEST_REACHABLE"
+else
+  echo "unreleased ($TARGET is on main but no v* tag relates to it)"
+fi

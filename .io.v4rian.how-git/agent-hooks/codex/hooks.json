@@ -1,0 +1,7 @@
+{
+  "PreToolUse": [
+    { "matcher": "^Bash$", "command": "codex-adapter.sh bash", "timeout": 10, "statusMessage": "how-git: checking the command" },
+    { "matcher": "^Bash$", "command": "codex-adapter.sh identity", "timeout": 10, "statusMessage": "how-git: setting the commit identity" },
+    { "matcher": "^(apply_patch|Edit|Write)$", "command": "codex-adapter.sh patch", "timeout": 5, "statusMessage": "how-git: checking the edited paths" }
+  ]
+}

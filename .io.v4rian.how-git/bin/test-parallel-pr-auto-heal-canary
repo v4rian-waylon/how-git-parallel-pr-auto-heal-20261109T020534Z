@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# test-parallel-pr-auto-heal-canary - operator-run wrapper for the
+# parallel-PR auto-heal scenario canary.
+#
+# Thin shim that locates the canonical script under scripts/ and forwards
+# every argument verbatim. Matches the bin/ vs scripts/ split the rest of
+# the framework uses: bin/ entries are the operator surface, scripts/ is
+# the implementation. Updating the script body never requires editing this
+# wrapper; updating the wrapper never requires editing the script body.
+#
+# This wrapper exists so an operator at the repo root can type:
+#
+#   .io.v4rian.how-git/bin/test-parallel-pr-auto-heal-canary --help
+#   .io.v4rian.how-git/bin/test-parallel-pr-auto-heal-canary --dry-run --token *** --account me
+#   .io.v4rian.how-git/bin/test-parallel-pr-auto-heal-canary --token *** --account me
+#   .io.v4rian.how-git/bin/test-parallel-pr-auto-heal-canary --token *** --account me --keep
+#
+# instead of remembering the scripts/ path. See the wrapped script's --help
+# for the full flag list, the API call sequence, the scenario contract, and
+# the exit codes.
+#
+# This is an OPERATOR-RUN test that creates AND deletes real GitHub repos
+# per invocation. The offline lifecycle suite at .io.v4rian.how-git/
+# framework-tests/test-lifecycle.sh exercises the auto-rebase L1-L5 ladder
+# and the reconcile naming chain against scratch repos with no network and
+# is the default CI gate; THIS tool is the operator's escape hatch for
+# proving the live claim-on-merge-dev workflow + the in-workflow auto-rebase
+# invocation + the conflict-heal ladder all wire together against a real
+# throwaway repo where the GitHub workflow actually fires.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+SCRIPT="$NS_DIR/scripts/test-parallel-pr-auto-heal-canary.sh"
+
+if [ ! -x "$SCRIPT" ]; then
+  echo "X test-parallel-pr-auto-heal-canary: canonical script missing or not executable at $SCRIPT" >&2
+  exit 1
+fi
+
+exec bash "$SCRIPT" "$@"

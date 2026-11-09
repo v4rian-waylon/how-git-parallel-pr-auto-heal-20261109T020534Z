@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# install-agent-hooks - install the how-git agent hooks into Claude Code and Codex CLI.
+#
+# The hooks in .io.v4rian.how-git/agent-hooks/ enforce the protocol rules an
+# agent can break before any git hook runs: destructive git without a fresh
+# preflight (guard-destructive.sh + git-preflight.sh), push to main, bare
+# force push, git add -A, remote repo deletion, rm outside temp roots,
+# printing credential files, and edits to a vendored framework copy
+# (guard-write.sh). identity-env.sh rewrites a git write (commit, merge,
+# annotated tag, cherry-pick, rebase, commit-tree, revert, am, pull) in a
+# repo whose origin org is in the identity map so it exports the mapped
+# identity first (PreToolUse updatedInput); identity.sh and identity-map are
+# copied beside it for repos without a vendored framework.
+#
+#   --claude   copy the guards to <claude>/hooks/how-git/ and merge their
+#              PreToolUse entries into <claude>/settings.json. Enforced: a
+#              deny stops the tool call.
+#   --codex    copy the guards and codex-adapter.sh to <codex>/hooks/how-git/,
+#              merge their PreToolUse entries into <codex>/hooks.json, add
+#              <codex>/rules/how-git.rules (execpolicy: bare force push and
+#              gh repo delete forbidden) and a marked block in
+#              <codex>/AGENTS.md. Enforced once trusted: Codex runs a
+#              non-managed hook only after it is reviewed and trusted in
+#              /hooks; the rules apply at once; AGENTS.md is advice.
+#   (neither)  both agents.
+#
+# Settings files are merged, never replaced: the user's other hooks stay,
+# the file is backed up to <file>.how-git-bak-<UTC> before the first write,
+# and a re-run with nothing to change writes nothing. --uninstall removes
+# exactly what the install added (recorded in hooks/how-git/.install.json)
+# and restores the original bytes when nothing else changed meanwhile.
+#
+# Usage:
+#   install-agent-hooks [--claude] [--codex] [--uninstall] [--dry-run] [--prefix DIR]
+#   install-agent-hooks -h|--help
+#
+#   --uninstall   reverse a previous install for the chosen agents
+#   --dry-run     print what would change; change nothing
+#   --prefix DIR  treat DIR as the home directory (<DIR>/.claude, <DIR>/.codex);
+#                 without it: $CLAUDE_CONFIG_DIR or ~/.claude, $CODEX_HOME or ~/.codex
+#
+# Requires python3 (installer) and jq (hooks at run time). Prints one line per
+# change; silent when nothing changed.
+#
+# Exit codes:
+#   0  installed, uninstalled, nothing to change, dry run, or help
+#   1  a settings file is not valid JSON, or a copy or write failed
+#   2  unknown flag, missing --prefix value, or python3 missing
+
+set -euo pipefail
+
+usage() { sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+CLAUDE=false; CODEX=false; UNINSTALL=false; DRY=false; PREFIX=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --claude) CLAUDE=true; shift ;;
+    --codex) CODEX=true; shift ;;
+    --uninstall) UNINSTALL=true; shift ;;
+    --dry-run) DRY=true; shift ;;
+    --prefix) [ $# -ge 2 ] && [ -n "$2" ] || { echo "X install-agent-hooks: --prefix needs a directory" >&2; exit 2; }; PREFIX="$2"; shift 2 ;;
+    --prefix=*) PREFIX="${1#--prefix=}"; [ -n "$PREFIX" ] || { echo "X install-agent-hooks: --prefix needs a directory" >&2; exit 2; }; shift ;;
+    -h|--help) usage ;;
+    *) echo "X install-agent-hooks: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+[ "$CLAUDE" = false ] && [ "$CODEX" = false ] && { CLAUDE=true; CODEX=true; }
+command -v python3 >/dev/null 2>&1 || { echo "X install-agent-hooks: python3 is required" >&2; exit 2; }
+command -v jq >/dev/null 2>&1 || echo "! install-agent-hooks: jq not found; the hooks need it at run time" >&2
+
+trap 'rc=$?; [ $rc -ne 0 ] && echo "X install-agent-hooks: exit $rc at: $BASH_COMMAND" >&2' EXIT
+
+SRC="$(cd "$(dirname "$0")/../agent-hooks" && pwd)"
+if [ -n "$PREFIX" ]; then
+  CLAUDE_HOME="$PREFIX/.claude"; CODEX_HOME_DIR="$PREFIX/.codex"
+else
+  CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+fi
+
+run() {  # run <agent> <agent-home> <settings-file>
+  python3 - "$1" "$2" "$3" "$SRC" "$UNINSTALL" "$DRY" <<'PY'
+import json, os, shutil, sys, time, filecmp
+agent, home, settings, src, uninstall, dry = sys.argv[1:7]
+uninstall, dry = uninstall == "true", dry == "true"
+hookdir = os.path.join(home, "hooks", "how-git")
+mpath = os.path.join(hookdir, ".install.json")
+changes = []
+def say(msg): changes.append(msg)
+
+def load(path):
+    if not os.path.exists(path): return None
+    with open(path) as f: raw = f.read()
+    if not raw.strip(): return {}
+    try: return json.loads(raw)
+    except ValueError as e:
+        print("X install-agent-hooks: %s is not valid JSON (%s); fix it first" % (path, e), file=sys.stderr); sys.exit(1)
+
+def dump(path, data):
+    with open(path, "w") as f: json.dump(data, f, indent=2); f.write("\n")
+
+def backup(path):
+    b = "%s.how-git-bak-%s" % (path, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+    shutil.copy2(path, b); say("backed up %s to %s" % (path, b)); return b
+
+def owned(cmd): return hookdir + "/" in cmd
+
+def strip_owned(data, keep=()):
+    """Remove every handler that runs a script from hookdir (except commands in keep); drop the
+    groups and events that removal empties. Groups and events of other tools are left as they are."""
+    h = data.get("hooks")
+    if not isinstance(h, dict): return data
+    for ev in list(h):
+        if not isinstance(h[ev], list): continue
+        kept, touched = [], False
+        for g in h[ev]:
+            hs = g.get("hooks", []) if isinstance(g, dict) else []
+            left = [x for x in hs if not (owned(str(x.get("command", ""))) and x.get("command") not in keep)]
+            if len(left) != len(hs):
+                touched = True
+                if not left: continue
+                g = dict(g, hooks=left)
+            kept.append(g)
+        if touched and not kept: del h[ev]
+        else: h[ev] = kept
+    return data
+
+manifest = load(mpath) or {}
+
+if uninstall:
+    if not manifest and not os.path.isdir(hookdir): sys.exit(0)
+    data = load(settings)
+    if data is not None:
+        new = strip_owned(json.loads(json.dumps(data)))
+        if manifest.get("hooks_key_added") and new.get("hooks") == {}: del new["hooks"]
+        if new != data or (manifest.get("settings_created") and new == {}):
+            if not dry:
+                orig = manifest.get("settings_backup")
+                if manifest.get("settings_created") and new == {}: os.remove(settings); say("removed %s (created by the install)" % settings)
+                elif orig and os.path.exists(orig) and load(orig) == new: shutil.copy2(orig, settings); say("restored %s from %s" % (settings, orig))
+                else: dump(settings, new); say("removed how-git hooks from %s" % settings)
+            else: say("would remove how-git hooks from %s" % settings)
+    for rel, created in manifest.get("extras", {}).items():
+        p = os.path.join(home, rel)
+        if rel.endswith("AGENTS.md"):
+            block = manifest.get("agents_block", "")
+            if os.path.exists(p) and block:
+                with open(p) as f: txt = f.read()
+                if block in txt:
+                    txt = txt.replace(block, "", 1)
+                    if not dry:
+                        if created and not txt.strip(): os.remove(p)
+                        else:
+                            with open(p, "w") as f: f.write(txt)
+                    say(("would remove" if dry else "removed") + " the how-git block from %s" % p)
+        elif os.path.exists(p):
+            if not dry: os.remove(p)
+            say(("would remove " if dry else "removed ") + p)
+    for f in manifest.get("files", []):
+        p = os.path.join(hookdir, f)
+        if os.path.exists(p):
+            if not dry: os.remove(p)
+    if os.path.exists(mpath) and not dry: os.remove(mpath)
+    created = [os.path.normpath(os.path.join(home, x)) for x in manifest.get("dirs_created", [])]
+    for d in sorted(set([hookdir] + created), key=lambda x: -x.count(os.sep)):  # deepest first
+        if os.path.isdir(d) and not dry:
+            try: os.rmdir(d)
+            except OSError: pass
+    say(("would remove " if dry else "removed ") + hookdir)
+    print("\n".join(changes)); sys.exit(0)
+
+# ---- install ----
+spec = load(os.path.join(src, agent, "hooks.json"))
+files = ["guard-destructive.sh", "git-preflight.sh", "guard-write.sh", "identity-env.sh"]
+srcs = {f: os.path.join(src, "shared", f) for f in files}
+# identity-env.sh falls back to these copies in repos that carry no vendored framework
+files += ["identity.sh", "identity-map"]
+srcs["identity.sh"] = os.path.join(src, "..", "scripts", "lib", "identity.sh")
+srcs["identity-map"] = os.path.join(src, "..", "identity-map")
+if agent == "codex":
+    files.append("codex-adapter.sh"); srcs["codex-adapter.sh"] = os.path.join(src, "codex", "codex-adapter.sh")
+
+dirs_created = list(manifest.get("dirs_created", []))
+for d in ["hooks", "hooks/how-git"]:
+    if not os.path.isdir(os.path.join(home, d)) and d not in dirs_created: dirs_created.append(d)
+if agent == "codex" and not os.path.isdir(os.path.join(home, "rules")) and "rules" not in dirs_created: dirs_created.append("rules")
+if not os.path.isdir(home) and "." not in dirs_created: dirs_created.insert(0, ".")
+
+for f in files:
+    dst = os.path.join(hookdir, f)
+    mode = 0o644 if f in ("identity.sh", "identity-map") else 0o755
+    if os.path.exists(dst) and filecmp.cmp(srcs[f], dst, shallow=False) and (os.stat(dst).st_mode & 0o777) == mode: continue
+    if not dry:
+        os.makedirs(hookdir, exist_ok=True); shutil.copyfile(srcs[f], dst); os.chmod(dst, mode)
+    say(("would install " if dry else "installed ") + dst)
+
+def cmd_for(entry):
+    script, _, args = entry["command"].partition(" ")
+    path = os.path.join(hookdir, script)
+    if any(c in path for c in " \t'\"$`\\;&|<>()*?[]{}"): path = "'%s'" % path.replace("'", "'\\''")
+    return path + ((" " + args) if args else "")
+
+existed = os.path.exists(settings)
+data = load(settings)
+data = {} if data is None else data
+before = json.loads(json.dumps(data))
+had_hooks_key = "hooks" in data
+wanted = []
+for ev, entries in spec.items():
+    for e in entries: wanted.append((ev, e))
+want_cmds = {cmd_for(e) for _, e in wanted}
+# drop stale handlers from an older install (owned but no longer wanted), keep everything else
+strip_owned(data, keep=want_cmds)
+h = data.setdefault("hooks", {})
+present = {x.get("command") for ev in h for g in h[ev] for x in g.get("hooks", [])}
+for ev, e in wanted:
+    c = cmd_for(e)
+    if c in present: continue
+    handler = {"type": "command", "command": c}
+    if "timeout" in e: handler["timeout"] = e["timeout"]
+    if agent == "codex" and "statusMessage" in e: handler["statusMessage"] = e["statusMessage"]
+    h.setdefault(ev, []).append({"matcher": e["matcher"], "hooks": [handler]})
+if not h and not had_hooks_key: del data["hooks"]
+
+new_manifest = dict(manifest)
+if data != before:
+    if dry: say("would add how-git hooks to %s" % settings)
+    else:
+        if existed and "settings_backup" not in manifest: new_manifest["settings_backup"] = backup(settings)
+        os.makedirs(os.path.dirname(settings), exist_ok=True)
+        dump(settings, data); say("added how-git hooks to %s" % settings)
+        new_manifest.setdefault("settings_created", not existed)
+        new_manifest.setdefault("hooks_key_added", not had_hooks_key)
+
+extras = dict(manifest.get("extras", {}))
+if agent == "codex":
+    rules = os.path.join(home, "rules", "how-git.rules")
+    rsrc = os.path.join(src, "codex", "how-git.rules")
+    if not (os.path.exists(rules) and filecmp.cmp(rsrc, rules, shallow=False)):
+        if not dry:
+            os.makedirs(os.path.dirname(rules), exist_ok=True); shutil.copyfile(rsrc, rules)
+        say(("would install " if dry else "installed ") + rules)
+        extras.setdefault("rules/how-git.rules", True)
+    agents = os.path.join(home, "AGENTS.md")
+    with open(os.path.join(src, "codex", "AGENTS.md")) as f:
+        block = "\n<!-- how-git:agent-hooks:begin -->\n" + f.read().replace("@HOOK_DIR@", hookdir) + "<!-- how-git:agent-hooks:end -->\n"
+    txt = open(agents).read() if os.path.exists(agents) else None
+    old = manifest.get("agents_block")
+    if txt is None or block not in txt:
+        if not dry:
+            base = txt or ""
+            if old and old in base: base = base.replace(old, "", 1)
+            with open(agents, "w") as f: f.write(base + block)
+        say(("would add" if dry else "added") + " the how-git block to %s" % agents)
+        extras.setdefault("AGENTS.md", txt is None)
+    new_manifest["agents_block"] = block
+
+new_manifest.update({"agent": agent, "files": files, "dirs_created": dirs_created, "extras": extras})
+if not dry and (changes or not os.path.exists(mpath)) and new_manifest != manifest:
+    os.makedirs(hookdir, exist_ok=True); dump(mpath, new_manifest)
+if changes: print("\n".join(changes))
+PY
+}
+
+if [ "$CLAUDE" = true ]; then out=$(run claude "$CLAUDE_HOME" "$CLAUDE_HOME/settings.json"); [ -n "$out" ] && printf '%s\n' "$out"; fi
+if [ "$CODEX" = true ]; then out=$(run codex "$CODEX_HOME_DIR" "$CODEX_HOME_DIR/hooks.json"); [ -n "$out" ] && printf '%s\n' "$out"; fi
+if [ "$CODEX" = true ] && [ "$UNINSTALL" = false ] && [ "$DRY" = false ] && [ -n "${out:-}" ]; then
+  echo "codex: open /hooks in Codex and trust the how-git hooks; until then only the rules and AGENTS.md apply"
+fi
+exit 0

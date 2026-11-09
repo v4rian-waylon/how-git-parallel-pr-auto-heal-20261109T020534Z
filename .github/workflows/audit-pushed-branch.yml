@@ -1,0 +1,67 @@
+name: audit-pushed-branch
+
+# Thin admin-only entry: re-runs the push-trigger fan-out (compile,
+# coverage, runtime, commit-audit, offline test suites and any usr-layer
+# ci/{tests,audits}/push/ script) against a branch or tag of this repo, or
+# a commit on one of its branches. ci-dispatch.yml refuses anything else
+# (refs/pull/*, foreign refs) before a script runs.
+#
+# It owns no logic. The automatic run on every pushed branch is
+# ci-dispatch.yml's push trigger; this file calls that same workflow with
+# trigger=push, so both paths execute the identical scripts. It has no
+# event trigger of its own, so a push never runs the audits twice.
+# A manual run is for reading only: its checks report as
+# "audit / <check>" on the dispatch ref's SHA, so it never satisfies a PR
+# required check; only the push run of the head SHA does (re-run that
+# ci-dispatch run to re-green one).
+#
+# Off-grid twin: .io.v4rian.how-git/bin/ci-local --workflow audit-pushed-branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to audit (empty: the ref the run is dispatched on).'
+        required: false
+        default: ''
+
+# Permissions: exactly ci-dispatch.yml's set. GitHub never elevates
+# permissions down a call chain, so the caller must grant what the called
+# workflow requests; the admin gate and ci-dispatch's ref validator are
+# what keep this token away from untrusted code. The set sits at workflow
+# level, which GitHub applies to every job including the calling one (its
+# docs give a called workflow the default token only when the calling job
+# has no permissions at all).
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  checks: write
+  issues: write
+  id-token: write
+  actions: read
+
+jobs:
+  admin:
+    name: verify actor is repo admin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: verify actor is repo admin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: bash .io.v4rian.how-git/scripts/workflows/verify-actor-admin.sh
+
+  audit:
+    needs: admin
+    uses: ./.github/workflows/ci-dispatch.yml
+    with:
+      trigger: push
+      ref: ${{ inputs.ref }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

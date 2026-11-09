@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# pre-push - branch-name regex guardrail.
+#
+# Under the new commit stage model (Step 2 of the lifecycle), the
+# heavy strategy / compile / coverage / runtime audits have moved
+# out of this hook. Two reasons:
+#
+#   1. The allocator now owns branch-shape correctness end-to-end,
+#      so the prior strategy audit largely re-checked what the
+#      remote was already going to reject.
+#   2. Compile, coverage, and runtime audits actually build and
+#      test the working tree. That belongs in CI, not on the
+#      developer's laptop.
+#
+# The async equivalents live in .github/workflows/ci-dispatch.yml
+# and report compile / coverage / runtime as required status checks on
+# the PR to dev. The branch-name regex stays here as the one cheap,
+# deterministic local guardrail that gives immediate feedback if
+# someone tries to push a misnamed local spike branch. Server rulesets
+# (connected mode) restrict who may create pool/* and safety/* refs; they
+# never check names, so this hook is the name check.
+#
+# Identity guardrail (rulings 6 and 8), run first and only when git passes
+# the remote and the origin org is mapped (bin/identity): every pushed
+# commit not yet on the remote must carry the mapped committer and author.
+# A pushed commit whose patch-id matches a remote commit the push leaves
+# behind is a rewrite: its author name, email and raw date (offset
+# included) must equal the original's, and only the committer may change.
+# Preflight backup branches (preflight-bak-*) are copies, not history a
+# push leaves behind, so they never count as originals.
+# A preflight backup branch named exactly preflight-bak-YYYY-MM-DD/NN
+# (HG_PREFLIGHT_BRANCH_RE) may be pushed; its snapshot commit is exempt from
+# the message rules, never from the identity gate.
+
+set -euo pipefail
+
+# The branch-name regex is the shared HG_BRANCH_RE from scripts/_lib.sh,
+# the one definition every hook and script sources. It accepts the
+# vYYYY.MAIN/ prefixed layout the allocator writes and the legacy flat
+# layout; examples are listed under the rejection message below.
+# Sourced next to this hook, like commit-msg does, so any core.hooksPath
+# pointing at this directory finds the helpers it ships with.
+# shellcheck source=../scripts/_lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/../scripts/_lib.sh"
+
+# git feeds the ref updates once on stdin; read them once so the identity
+# gate and the branch loop below both see every line.
+PUSH_LINES=""
+if [ ! -t 0 ]; then PUSH_LINES=$(cat); fi
+
+identity_gate() {
+  local remote="$1" tmp bad=0 lref lsha rref rsha excl c ce cn ae an ad pid orig want
+  # shellcheck source=../scripts/lib/identity.sh
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../scripts/lib/identity.sh"
+  identity_expected_email >/dev/null 2>&1 || return 0
+  want=$(identity_expected_email)
+  tmp=$(mktemp -d)
+  while read -r lref lsha rref rsha; do
+    case "$lsha" in ''|*[!0]*) ;; *) continue ;; esac
+    [ -n "$lsha" ] || continue
+    excl=""
+    case "$rsha" in *[!0]*) git cat-file -e "$rsha^{commit}" 2>/dev/null && excl="^$rsha" ;; esac
+    git rev-list "$lsha" --not --remotes="$remote" $excl > "$tmp/new"
+    git log -p --no-merges --max-count="${HOW_GIT_REWRITE_SCAN:-2000}" --format='commit %H' \
+      --exclude="$remote/preflight-bak-*" --remotes="$remote" --not "$lsha" 2>/dev/null \
+      | git patch-id --stable > "$tmp/orig" || true
+    while read -r c; do
+      ce=$(git log -1 --format=%ce "$c"); ae=$(git log -1 --format=%ae "$c")
+      an=$(git log -1 --format=%an "$c"); ad=$(git log -1 --format=%ad --date=raw "$c")
+      orig=""
+      # An amend of the tip this push replaces (same tree, same parents) is a
+      # rewrite of it, merges included: a claim amends a PR merge that GitHub
+      # authored as the merging user, and a merge has no patch-id to match.
+      if [ -n "$excl" ] && [ "$(git rev-parse "$c^{tree}" "$c^@" 2>/dev/null)" = "$(git rev-parse "$rsha^{tree}" "$rsha^@" 2>/dev/null)" ]; then
+        orig="$rsha"
+      fi
+      if [ -z "$orig" ] && [ -s "$tmp/orig" ]; then
+        pid=$(git show "$c" | git patch-id --stable | cut -d' ' -f1)
+        # Several originals can share one patch-id (a change, its revert,
+        # the change again); the rewrite keeps its author if any one matches.
+        if [ -n "$pid" ]; then
+          for o in $(awk -v p="$pid" '$1 == p { print $2 }' "$tmp/orig"); do
+            orig="$o"
+            [ "$an|$ae|$ad" = "$(git log -1 --format='%an|%ae|%ad' --date=raw "$o")" ] && break
+          done
+        fi
+      fi
+      if [ -n "$orig" ] && [ "$an|$ae|$ad" != "$(git log -1 --format='%an|%ae|%ad' --date=raw "$orig")" ]; then
+        echo "X $c rewrites ${orig} but changes its author (keep name, email and date; only the committer may change)" >&2
+        bad=1
+      fi
+      cn=$(git log -1 --format=%cn "$c")
+      if ! identity_email_allowed "$ce" || ! identity_name_allowed "$cn" "$ce"; then
+        echo "X $c committer $cn <$ce> is not this repo's identity <$want>" >&2; bad=1
+      fi
+      if [ -z "$orig" ] && { ! identity_email_allowed "$ae" || ! identity_name_allowed "$an" "$ae"; }; then
+        echo "X $c author $an <$ae> is not this repo's identity <$want>" >&2; bad=1
+      fi
+    done < "$tmp/new"
+  done
+  rm -rf "$tmp"
+  [ "$bad" -eq 0 ] || { echo "  Fix: eval \"\$(.io.v4rian.how-git/bin/identity --export)\" and recommit" >&2; return 1; }
+}
+
+# git passes <remote> <url> and the ref updates on stdin; direct calls
+# without arguments (branch-regex checks) skip the identity gate.
+if [ $# -ge 2 ]; then
+  identity_gate "$1" <<<"$PUSH_LINES"
+fi
+
+# Merge policy for pool -> dev (MERGE_POLICY + WARP, roadmap pool 7). A
+# push that lands merge commits on dev outside CI is a local close-up:
+# the operator must be an allowed merger (dev_merge_who), and in connected
+# mode dev_merge_pr=required means pools reach dev only through a PR.
+# bin/warp on lifts both. Pushes to main are never touched here.
+NS_DIR="$(git rev-parse --show-toplevel)/.io.v4rian.how-git"
+if [ -z "${CI:-}" ] && [ -f "$NS_DIR/scripts/_merge_policy.sh" ]; then
+  # shellcheck source=../scripts/_merge_policy.sh
+  . "$NS_DIR/scripts/_merge_policy.sh"
+  zero=0000000000000000000000000000000000000000
+  mode=connected
+  [ -f "$NS_DIR/MODE" ] && mode=$(tr -d '[:space:]' < "$NS_DIR/MODE")
+  while read -r _lref lsha rref rsha; do
+    [ "$rref" = "refs/heads/dev" ] || continue
+    # The connected-mode claim ceremony pushes the amended merge itself
+    # (in CI, or the local test rig); its merge already came through the
+    # PR path. Off-grid claim pushes stay checked, so a post-merge
+    # auto-claim cannot bypass dev_merge_who.
+    [ "${V4RIAN_CLAIM_PUSH:-}" = "1" ] && [ "$mode" = "connected" ] && continue
+    [ "$lsha" = "$zero" ] && continue
+    if [ "$rsha" = "$zero" ] || ! git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+      merges=$(git rev-list --merges "$lsha" --not --remotes)
+    else
+      merges=$(git rev-list --merges "$rsha..$lsha")
+    fi
+    [ -z "$merges" ] && continue
+    # Pool size cap (dev_merge_max_commits): checked on every first-parent
+    # merge the push lands on dev, warp or not.
+    if [ "$rsha" = "$zero" ] || ! git cat-file -e "$rsha^{commit}" 2>/dev/null; then
+      fp_merges=$(git rev-list --merges --first-parent "$lsha" --not --remotes)
+    else
+      fp_merges=$(git rev-list --merges --first-parent "$rsha..$lsha")
+    fi
+    for m in $fp_merges; do
+      if ! reason=$(mp_check_pool_size "$m"); then
+        echo "X Refusing to push merge $(git rev-parse --short "$m") to dev: $reason" >&2
+        exit 1
+      fi
+    done
+    if [ "$(warp_state)" = "on" ]; then
+      echo "!! WARP MODE ON: direct merge push to dev allowed (merge policy who/PR/approval lifted)" >&2
+      continue
+    fi
+    if [ "$mode" = "connected" ] && [ "$(mp_effective dev_merge_pr)" = "required" ]; then
+      echo "X Refusing to push: merge commits to dev outside a PR (dev_merge_pr=required)." >&2
+      echo "  Open the PR instead: bin/init-pool-merge" >&2
+      echo "  Policy: .io.v4rian.how-git/MERGE_POLICY (bin/set-merge-policy dev_merge_pr=optional)" >&2
+      echo "  Prototyping: bin/warp on lifts this rule for pool -> dev only." >&2
+      exit 1
+    fi
+    if ! reason=$(mp_may_merge "$(git config --get user.email 2>/dev/null || true)"); then
+      echo "X Refusing to push merge commits to dev: $reason" >&2
+      exit 1
+    fi
+  done <<<"$PUSH_LINES"
+fi
+
+# Merge message shape (git-merge-audit rule 5) for every merge commit the
+# push carries: on dev and main every first-parent merge, elsewhere every
+# [MERGE] subject. Read from the ref lines git feeds on stdin, so pushing
+# dev from any checkout is covered. The claim's "PR #N <url>" paragraph is
+# allowed at the top of the body.
+hook_dir=$(cd "$(dirname "$0")" && pwd)
+checker="$hook_dir/../scripts/check-merge-message.sh"
+merge_fail=0
+while read -r _lref lsha rref rsha; do
+  [ -n "${lsha:-}" ] || continue
+  case "$lsha" in *[!0]*) ;; *) continue ;; esac
+  case "$rsha" in
+    *[!0]*) range="$rsha..$lsha" ;;
+    *)      range="$lsha --not --remotes" ;;
+  esac
+  case "$rref" in
+    refs/heads/dev|refs/heads/main) fp="--first-parent" ;;
+    *)                              fp="" ;;
+  esac
+  # shellcheck disable=SC2086
+  for sha in $(git rev-list --merges $fp $range 2>/dev/null); do
+    subj_line=$(git log -1 --format=%s "$sha")
+    if [ -z "$fp" ]; then
+      case "$subj_line" in "[MERGE] "*) ;; *) continue ;; esac
+    fi
+    if ! bash "$checker" --commit "$sha" --pr-ref; then
+      # The claim gates the message it writes or amends before it pushes;
+      # any other merge in its push already landed, and refusing it would
+      # stop the claim from sealing its version (DECISIONS, orchestrator
+      # defaults). A claim push warns; every other push is refused.
+      if [ "${V4RIAN_CLAIM_PUSH:-}" = "1" ]; then
+        echo "!! merge commit $(git rev-parse --short "$sha") already landed outside the merge message shape; the claim publishes it with this warning" >&2
+      else
+        echo "X Refusing to push: merge commit $(git rev-parse --short "$sha") breaks the merge message shape" >&2
+        merge_fail=1
+      fi
+    fi
+  done
+done <<<"$PUSH_LINES"
+[ "$merge_fail" -eq 0 ] || exit 1
+
+
+# Police the refs being pushed, not the name of HEAD. Git hands the hook
+# one "<local ref> <local sha> <remote ref> <remote sha>" line per pushed
+# ref on stdin, so a lane pushed from a detached HEAD
+# (git push origin HEAD:refs/heads/pool/...) is judged by its destination
+# name, and a misnamed destination is refused whatever HEAD is called.
+# Deletions, tags, and non-branch refs pass; branch destinations must be
+# main, dev, a well-formed pool/safety name, or an archive vault/ name.
+#
+# The same pass re-checks the message rules (hg_message_violations) on every
+# commit a working-branch push publishes for the first time: commit-msg is
+# skipped by --no-verify and by an opted-out auto-fix only through it, so
+# this is the second deterministic line. main, dev, and vault pushes are
+# not re-checked here: they carry merges of already-checked branches and the
+# claim ceremonies push them.
+remote_name="${1:-origin}"
+remote_url="${2:-$remote_name}"
+ZERO_SHA=0000000000000000000000000000000000000000
+bad_refs=""
+bad_msgs=""
+saw_ref=false
+if [ -n "$PUSH_LINES" ]; then
+  while read -r _local_ref local_sha remote_ref remote_sha; do
+    [ -n "${remote_ref:-}" ] || continue
+    saw_ref=true
+    # refs/how-git/* are this clone's allocator reservations (one per number
+    # handed out off-grid, see scripts/allocate-pool-branch.sh): local
+    # bookkeeping, so an explicit refspec or a --mirror push is refused
+    # before any branch rule. A delete cleans a leaked one off a remote.
+    if [ "$_local_ref" != "(delete)" ]; then
+      case "$_local_ref $remote_ref" in
+        refs/how-git/*|*" refs/how-git/"*)
+          echo "X Refusing to push '${remote_ref:-$_local_ref}': refs/how-git/* are local allocator reservations and never leave this clone." >&2
+          echo "  Push branches by name (git push origin <branch>), not --mirror or refs/how-git/." >&2
+          exit 1 ;;
+      esac
+    fi
+    [ "$local_sha" = "$ZERO_SHA" ] && continue
+    case "$remote_ref" in
+      refs/heads/*)
+        name="${remote_ref#refs/heads/}"
+        if [[ "$name" =~ $HG_VAULT_BRANCH_RE ]]; then
+          continue
+        fi
+        # A preflight backup is a snapshot copy of the working tree, not
+        # history; its commit message is the backup note, so only the exact
+        # name shape is judged.
+        if [[ "$name" =~ $HG_PREFLIGHT_BRANCH_RE ]]; then
+          continue
+        fi
+        if ! hg_branch_name_ok "$name"; then
+          bad_refs="$bad_refs $name"
+          continue
+        fi
+        case "$name" in main|dev) continue ;; esac
+        # Only commits new to the destination, judged from destination
+        # facts alone: every tip it advertises (git ls-remote of the pushed
+        # URL or remote, resolved in one cat-file batch) and the old value
+        # of the ref being updated. Local tags, local main or dev, and
+        # remote-tracking refs are never trusted: anyone can create them
+        # locally to hide a commit. Two fallbacks, both narrow:
+        #   - ls-remote failed (offline) and $1 is a remote name: that
+        #     remote's tracking refs stand in for its advertisement;
+        #   - the destination advertises nothing this repo has (an empty
+        #     mirror, a first push by URL): the lane's own safety anchor
+        #     (its allocation point) and the newest claim tag reachable
+        #     from the lane (vYYYY.S.D, which seals audited history) bound
+        #     the range, so legacy history is never re-judged. With neither,
+        #     every commit is judged. Both are local refs a pusher could
+        #     forge; that residual is accepted on this one path and the
+        #     server-side rulesets and the CI commit-audit stay the final
+        #     authority (RUNBOOK, message rules).
+        if [ -z "${known_tips_done:-}" ]; then
+          known_tips=""
+          if adv=$(GIT_TERMINAL_PROMPT=0 git ls-remote "$remote_url" </dev/null 2>/dev/null); then
+            known_tips=$(printf '%s\n' "$adv" | awk 'NF {print $1 "^{commit}"}' | sort -u \
+              | git cat-file --batch-check='%(objectname)' 2>/dev/null | awk '$2 != "missing" {print $1}' | tr '\n' ' ')
+          elif git remote | grep -qxF -- "$remote_name"; then
+            known_tips="--remotes=$remote_name"
+          fi
+          known_tips_done=1
+        fi
+        old_tip=""
+        if [ "$remote_sha" != "$ZERO_SHA" ] && git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+          old_tip="$remote_sha"
+        fi
+        anchor=""
+        if [ -z "$(printf '%s' "$known_tips" | tr -d ' ')" ] && [ -z "$old_tip" ]; then
+          case "$name" in
+            pool/*) anchor=$(git rev-parse -q --verify "refs/heads/safety/${name#pool/}^{commit}" 2>/dev/null || true) ;;
+          esac
+          claim_tag=$(git tag --merged "$local_sha" --sort=-v:refname 2>/dev/null \
+            | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+$' | head -1 || true)
+          if [ -n "$claim_tag" ]; then
+            anchor="$anchor $(git rev-parse "$claim_tag^{commit}")"
+          fi
+        fi
+        # shellcheck disable=SC2086
+        range=$(git rev-list "$local_sha" --not $known_tips $old_tip $anchor </dev/null 2>/dev/null || true)
+        msg_tmp=$(mktemp -t pre-push-msg.XXXXXX)
+        for sha in $range; do
+          git log -1 --format=%B "$sha" > "$msg_tmp"
+          if ! v=$(hg_message_violations "$msg_tmp"); then
+            bad_msgs="$bad_msgs
+  $(git log -1 --format='%h %s' "$sha"): $(printf '%s' "$v" | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
+          fi
+        done
+        rm -f "$msg_tmp"
+        ;;
+    esac
+  done <<<"$PUSH_LINES"
+fi
+
+# Invoked by hand (no refspec lines): fall back to the current branch. A
+# detached HEAD has no name to judge.
+if ! $saw_ref; then
+  head_name=$(git rev-parse --abbrev-ref HEAD)
+  if [ "$head_name" != "HEAD" ] && ! hg_branch_name_ok "$head_name"; then
+    bad_refs=" $head_name"
+  fi
+fi
+
+if [ -n "$bad_refs" ]; then
+  branch="${bad_refs# }"
+  cat >&2 <<EOF
+X Refusing to push: branch name '$branch' is invalid.
+
+  Required:  $HG_BRANCH_FORMAT
+  Examples:  pool/v2026.0/n3.feature.parser-rewrite
+             pool/n3.feature.sprint4-parser-rewrite
+             pool/v2026.0/n7.fix.PROJ-123-token-leak
+             pool/n12.r&d.sprint5-PROJ-456-embedding-cache
+             pool/v2026.0/n22.doc.runbook-rewrite
+
+  Rename:    git branch -m <new-name>
+
+  NOTE: this hook is the branch-name check; no server rule validates names.
+  In connected mode the pool-creations and safety-lockdown rulesets (when
+  applied) restrict who may create pool/* and safety/* at all: only the
+  allocator mints them. The flat layout is the legacy form kept for
+  backwards compatibility; new allocations carry the vYYYY.MAIN/ prefix.
+  See docs/Git_Strategy.md for the full picture.
+EOF
+  exit 1
+fi
+
+if [ -n "$bad_msgs" ]; then
+  cat >&2 <<EOF
+X Refusing to push: commit messages break the message rules:$bad_msgs
+
+  Reword them (git rebase -i, reword) and push again. The auto-fix repairs
+  these at commit time unless it was switched off (HOW_GIT_AUTOFIX=0 or
+  git config howgit.autofix false) or the commit was made with --no-verify.
+EOF
+  exit 1
+fi

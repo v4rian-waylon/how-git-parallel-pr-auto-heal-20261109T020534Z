@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# version - canonical version utility for the v4rian model.
+#
+# All version state is derived deterministically from git merge records.
+# The version is born on dev: every pool->dev merge gets a fresh tag.
+# When dev is merged to main, the release REUSES the SAME tag - same
+# code, same version. main releases do not bump anything. The release
+# is a GitHub Release object attached to the existing dev tag, not a
+# new git tag.
+#
+#   YEAR   = current calendar year (UTC).
+#   SERIES = count of main first-parent merges this YEAR (auto-derived
+#            from main's first-parent line). Advances by one with each
+#            dev->main release; 0 until the first main release of the
+#            year. The "release cycle" number - NOT manually bumped.
+#   DEV    = count of pool->dev merges in the CURRENT release cycle (a
+#            cycle is the span between consecutive main releases).
+#            Increments per pool->dev merge; resets each release cycle
+#            (when SERIES advances). Pre-first-main is 1-based, post-
+#            first-main is 0-based (DEV=0 = the just-sealed release).
+#
+# The current version is ALWAYS 3 segments: vYEAR.SERIES.DEV. Every
+# version a developer sees - on dev, on main after release, anywhere
+# - is the same shape, no special-case ".0" release variant.
+#
+# Every other tool in the template (claim-dev-merge, claim-main-release,
+# open-pr, build-on-tag, auto-rebase-pools-after-dev-merge) calls this
+# utility instead of reimplementing the math. One source of truth.
+#
+# Counting note: dev->main merges MUST be --no-ff so a merge commit lands
+# on main's first-parent line. The v4rian model requires this for
+# countability. Without it, main is just FF'd to dev and the merge is
+# invisible to `git log --first-parent --merges`.
+#
+# Usage:
+#   version                  vYEAR.SERIES.DEV-<sha7>.<build>  (current state, identifier mode)
+#   version --seal           vYEAR.SERIES.DEV                   (current sealed version, no SHA/build)
+#   version --release-tag    SAME as --seal (release REUSES the dev tag)
+#   version --seal --at REV  what --seal returned right after REV landed (REV year, prior releases)
+#   version --next-dev       vYEAR.SERIES.(DEV+1)               (the dev tag a pool->dev merge would claim next)
+#   version --build          like default but increments local build counter first
+#   version --next-build     like default with build+1 but does NOT persist (preview)
+#   version --counter        prints just the current build counter
+#   version --reset          resets the build counter to 0 (interactive confirm)
+#   version --components     prints "YEAR<tab>SERIES<tab>DEV<tab>BUILD<tab>SHA7" for scripting
+#   version -h | --help      print this help
+#
+# Preconditions: inside a git repo. Every mode is read-only except --build
+# (increments version.build at the repo root) and --reset (writes 0 after an
+# interactive confirm).
+#
+# Exit codes:
+#   0  version printed, counter shown or reset, or help
+#   1  --reset not confirmed
+#   2  not a git repo, or an unknown flag
+
+set -euo pipefail
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0; }
+
+for _arg in "$@"; do case "$_arg" in -h|--help) usage ;; esac; done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X version: not inside a git repo" >&2
+  exit 2
+fi
+
+MODE=identifier
+AT_REV=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --seal)         MODE=seal; shift ;;
+    --release-tag)  MODE=release; shift ;;
+    --next-dev)     MODE=nextdev; shift ;;
+    --build)        MODE=build; shift ;;
+    --next-build)   MODE=nextbuild; shift ;;
+    --counter)      MODE=counter; shift ;;
+    --reset)        MODE=reset; shift ;;
+    --components)   MODE=components; shift ;;
+    --at)           AT_REV="${2:-}"; [ -n "$AT_REV" ] || { echo "X --at needs a revision" >&2; exit 2; }; shift 2 ;;
+    -h|--help)      usage ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+BUILD_FILE="$REPO_ROOT/version.build"
+
+read_counter() { [ -f "$BUILD_FILE" ] && cat "$BUILD_FILE" || echo 0; }
+write_counter() { echo "$1" > "$BUILD_FILE"; }
+
+if [ "$MODE" = counter ]; then
+  read_counter
+  exit 0
+fi
+
+if [ "$MODE" = reset ]; then
+  printf 'Reset build counter (currently %s) to 0? [y/N] ' "$(read_counter)" >&2
+  read -r confirm
+  case "$confirm" in
+    y|Y|yes|YES) write_counter 0; echo "reset to 0" >&2 ;;
+    *) echo "cancelled" >&2; exit 1 ;;
+  esac
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Compute YEAR / SERIES / DEV from merge counts.
+#
+# SERIES = count of main merges this year (auto-derived from main's
+#          first-parent line). Reflects the "release cycle number".
+#
+# DEV    = count of dev merges in the CURRENT cycle. A "cycle" is the
+#          span since the last main merge (or since year start if no
+#          main release has happened yet).
+#
+# Per-mode adjustment:
+#   --next-dev (PR title, called BEFORE next merge):
+#       cycle 0 (no main yet)  → DEV = count + 1  (1-based start; no
+#                                                  v.0.0 anchor exists)
+#       cycle 1+ (post first main) → DEV = count  (0-based; main release
+#                                                  acts as v.X.0 anchor)
+#   --seal (just-tagged version, called AFTER merge):
+#       always = --next-dev - 1 (same count, sampled on the other side
+#       of the merge event)
+#
+# The +1 in cycle 0 is intrinsic to 1-based counting, NOT a version
+# bump. Counting merges is the unfailing primitive: every merge IS a
+# git event on the first-parent line, regardless of whether the tag
+# claim later succeeded. Tag-based derivation (git describe + 1) is
+# the bug pattern that silently reassigns orphan slots and compresses
+# the tag chain.
+# ---------------------------------------------------------------------------
+
+NOW_YEAR=$(date -u +%Y)
+
+if git rev-parse --verify --quiet dev >/dev/null 2>&1; then
+  DEV_REF=dev
+elif git rev-parse --verify --quiet origin/dev >/dev/null 2>&1; then
+  DEV_REF=origin/dev
+else
+  DEV_REF=HEAD
+fi
+
+# --at REV samples the dev line at REV instead of its tip, so the claim can
+# name the number an older merge spent (sealing a merge nobody claimed).
+if [ -n "$AT_REV" ]; then
+  DEV_REF=$(git rev-parse --verify --quiet "$AT_REV^{commit}") \
+    || { echo "X version: --at $AT_REV is not a commit" >&2; exit 2; }
+fi
+
+if git rev-parse --verify --quiet main >/dev/null 2>&1; then
+  MAIN_REF=main
+elif git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+  MAIN_REF=origin/main
+else
+  MAIN_REF=""
+fi
+
+# SERIES = count of main merges this year on main's first-parent line.
+# MAIN_CUT is the main point whose history counts as shipped (main's tip).
+SINCE="--since=${NOW_YEAR}-01-01T00:00:00Z"
+UNTIL=""
+SERIES=0
+MAIN_CUT="$MAIN_REF"
+if [ -n "$MAIN_REF" ]; then
+  SERIES=$(git log "$MAIN_REF" --first-parent --merges "$SINCE" --pretty=oneline 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+# --at REV answers what --seal returned right after REV landed: the year is
+# REV's own (UTC committer date), and only the releases that shipped a
+# proper ancestor of REV count, the newest of them being main at that time
+# (a release merges the then dev tip, so its second parent precedes REV
+# exactly when the release happened before REV).
+if [ -n "$AT_REV" ]; then
+  NOW_YEAR=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y "$DEV_REF")
+  SINCE="--since=${NOW_YEAR}-01-01T00:00:00Z"
+  UNTIL="--until=$((NOW_YEAR + 1))-01-01T00:00:00Z"
+  SERIES=0
+  MAIN_CUT=""
+  if [ -n "$MAIN_REF" ]; then
+    for rel in $(git rev-list --first-parent --merges "$SINCE" ${UNTIL:+"$UNTIL"} "$MAIN_REF" 2>/dev/null); do
+      shipped=$(git rev-parse --verify --quiet "$rel^2" 2>/dev/null) || continue
+      [ "$shipped" != "$DEV_REF" ] || continue
+      git merge-base --is-ancestor "$shipped" "$DEV_REF" 2>/dev/null || continue
+      SERIES=$((SERIES + 1))
+      [ -n "$MAIN_CUT" ] || MAIN_CUT="$rel"
+    done
+  fi
+fi
+
+# DEV_IN_CYCLE = count of dev merges this year that are NOT already
+# reachable from main. Cycle 1+: excludes dev merges already shipped
+# via a previous dev->main merge. Cycle 0 (no main releases): includes
+# every dev merge this year.
+if [ -n "$MAIN_CUT" ] && [ "$SERIES" -gt 0 ]; then
+  DEV_IN_CYCLE=$(git log "$DEV_REF" --first-parent --merges "$SINCE" ${UNTIL:+"$UNTIL"} --not "$MAIN_CUT" --pretty=oneline 2>/dev/null | wc -l | tr -d ' ')
+else
+  DEV_IN_CYCLE=$(git log "$DEV_REF" --first-parent --merges "$SINCE" ${UNTIL:+"$UNTIL"} --pretty=oneline 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+# Derive NEXT_DEV (candidate version's DEV slot) and SEAL_DEV (latest
+# already-tagged version's DEV slot) from DEV_IN_CYCLE + SERIES.
+if [ "$SERIES" -eq 0 ]; then
+  NEXT_DEV=$((DEV_IN_CYCLE + 1))
+else
+  NEXT_DEV=$DEV_IN_CYCLE
+fi
+SEAL_DEV=$((NEXT_DEV - 1))
+
+SHA=$(git rev-parse --short=7 HEAD 2>/dev/null || echo "0000000")
+
+case "$MODE" in
+  seal|release)
+    # Release REUSES the dev tag - same value as seal. The "release"
+    # is a GitHub Release object attached to the existing dev tag.
+    # Edge: cycle 1+ with zero dev merges yet (just after main merge,
+    # before any dev integration in the new cycle) → SEAL_DEV would
+    # be -1; fall back to the latest reachable v* tag this year.
+    if [ "$SEAL_DEV" -lt 0 ]; then
+      # Highest claim tag (an ANNOTATED vYEAR.SERIES.DEV tag; claims never
+      # make lightweight ones) merged into the dev line, ordered by SERIES
+      # then DEV numerically. Version order, not git describe's graph-depth
+      # scoring (flips when two commits share a second), and annotated
+      # only, so a stray lightweight tag of that shape cannot become the
+      # reused release version.
+      FALLBACK=$(git for-each-ref --merged "$DEV_REF" \
+          --format='%(objecttype) %(refname:short)' "refs/tags/v${NOW_YEAR}.*" 2>/dev/null \
+        | awk -v re="^v${NOW_YEAR}[.][0-9]+[.][0-9]+\$" '$1 == "tag" && $2 ~ re {print $2}' \
+        | sort -t. -k2,2n -k3,3n | tail -1 || true)
+      if [ -n "$FALLBACK" ]; then
+        echo "$FALLBACK"
+      else
+        printf 'v%s.0.0\n' "$NOW_YEAR"
+      fi
+    else
+      printf 'v%s.%s.%s\n' "$NOW_YEAR" "$SERIES" "$SEAL_DEV"
+    fi
+    ;;
+  nextdev)
+    printf 'v%s.%s.%s\n' "$NOW_YEAR" "$SERIES" "$NEXT_DEV"
+    ;;
+  components)
+    printf '%s\t%s\t%s\t%s\t%s\n' "$NOW_YEAR" "$SERIES" "$NEXT_DEV" "$(read_counter)" "$SHA"
+    ;;
+  build)
+    COUNTER=$(read_counter)
+    COUNTER=$((COUNTER + 1))
+    write_counter "$COUNTER"
+    printf 'v%s.%s.%s-%s.%s\n' "$NOW_YEAR" "$SERIES" "$NEXT_DEV" "$SHA" "$COUNTER"
+    ;;
+  nextbuild)
+    COUNTER=$(read_counter)
+    COUNTER=$((COUNTER + 1))
+    printf 'v%s.%s.%s-%s.%s\n' "$NOW_YEAR" "$SERIES" "$NEXT_DEV" "$SHA" "$COUNTER"
+    ;;
+  identifier)
+    COUNTER=$(read_counter)
+    printf 'v%s.%s.%s-%s.%s\n' "$NOW_YEAR" "$SERIES" "$NEXT_DEV" "$SHA" "$COUNTER"
+    ;;
+esac

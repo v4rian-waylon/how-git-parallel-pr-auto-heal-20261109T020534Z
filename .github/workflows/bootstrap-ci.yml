@@ -1,0 +1,88 @@
+name: bootstrap-ci
+
+# Read-only drift report of the repository's CI setup. bin/bootstrap-ci
+# applies the setup locally under the operator's own gh session; this
+# workflow only checks it under the workflow's own read token, so no
+# operator or Claude token ever travels as a workflow input (inputs are not
+# secret: they reach the event payload, logs and webhooks; see
+# docs/ci-trust-model.md). Steps that need admin scope report what they
+# cannot read instead of failing.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: bootstrap-ci
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  bootstrap:
+    name: Bootstrap repo CI (rules, required checks, merge defaults, topics)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TOKEN: ${{ github.token }}
+      OWNER_REPO: ${{ github.repository }}
+      REPO_ROOT: ${{ github.workspace }}
+      NS_DIR: .io.v4rian.how-git
+      MODE: check
+      TOKEN_SRC: 'workflow token (read-only check)'
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Install Claude Code on the runner so step_claude_setup sees a
+      # claude binary in part one of its probe. The pinned version
+      # matches ci-dispatch.yml's inline install step. ubuntu-latest
+      # does not ship claude per the runner-images manifest, so the
+      # explicit install is required.
+      - name: step_actions_enabled
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" actions_enabled
+
+      - name: step_workflows_enabled
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" workflows_enabled
+
+      - name: step_seed_dev
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" seed_dev
+
+      # step_apply_rules shells out to apply-repo-rules.sh per the
+      # delegation pattern the prior bin/bootstrap-ci used. The script
+      # owns the 422 soft-skip handlers for the GITHUB_TOKEN admin-scope
+      # gap (Name must be unique).
+      - name: step_apply_rules
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" apply_rules
+
+      - name: step_required_checks
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" required_checks
+
+      - name: step_merge_commit_defaults
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" merge_commit_defaults
+
+      - name: step_merge_mode_lock
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" merge_mode_lock
+
+      - name: step_disable_auto_delete
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" disable_auto_delete
+
+      - name: step_topics
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" topics
+
+      - name: step_trusted_env
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" trusted_env
+
+      - name: step_claude_setup
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" claude_setup
+
+      - name: step_consumer_cleanup
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" consumer_cleanup
+
+      - name: step_report
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" report

@@ -1,0 +1,21 @@
+# how-git execpolicy rules for Codex CLI (installed by bin/install-agent-hooks --codex).
+# Defence in depth for the two protocol bans that need no repo state: a bare force push and
+# deleting a remote repo. Everything that needs repo state (preflight freshness, push to main,
+# staging) is the PreToolUse hook's job (hooks/how-git/codex-adapter.sh). Codex splits plain
+# `bash -lc` chains into commands; a script with redirection or substitution is matched whole.
+
+prefix_rule(
+    pattern = ["git", "push", ["--force", "-f"]],
+    decision = "forbidden",
+    justification = "how-git: a bare force push can drop published commits; preflight, then use --force-with-lease.",
+    match = ["git push --force origin dev", "git push -f origin dev"],
+    not_match = ["git push origin dev", "git push --force-with-lease origin dev"],
+)
+
+prefix_rule(
+    pattern = ["gh", "repo", "delete"],
+    decision = "forbidden",
+    justification = "how-git: only the repo owner deletes a remote repo, by name, by hand.",
+    match = ["gh repo delete o/r --yes"],
+    not_match = ["gh repo view o/r"],
+)

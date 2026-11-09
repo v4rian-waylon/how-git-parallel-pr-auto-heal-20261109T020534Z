@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# status - one-screen status of the current v4rian repo.
+#
+# Reports: current branch, current version (from bin/version --seal),
+# latest reachable tag, commits ahead/behind origin, open PR count (if
+# gh available), recent dev claims this cycle.
+#
+# Designed for at-a-glance "where am I, what's queued, what's next"
+# orientation. No mutations.
+#
+# Usage:
+#   status              human-readable summary
+#   status --json       machine-readable JSON
+#   status -h|--help    print this help
+#
+# Exit codes:
+#   0  summary printed, or help
+#   2  not a git repo, or an unknown flag
+
+set -euo pipefail
+
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0; }
+
+for _arg in "$@"; do case "$_arg" in -h|--help) usage ;; esac; done
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X status: not inside a git repo" >&2
+  exit 2
+fi
+
+JSON=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) JSON=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+VERSION_BIN="$REPO_ROOT/.io.v4rian.how-git/bin/version"
+
+cd "$REPO_ROOT"
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+SHA=$(git rev-parse --short=7 HEAD)
+SEAL=$([ -x "$VERSION_BIN" ] && "$VERSION_BIN" --seal 2>/dev/null || echo "?")
+LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "<none>")
+
+# Ahead/behind vs origin/<branch>, if upstream exists
+AHEAD=0; BEHIND=0
+if git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null 2>&1; then
+  AHEAD=$(git rev-list --count "origin/$BRANCH..HEAD" 2>/dev/null || echo 0)
+  BEHIND=$(git rev-list --count "HEAD..origin/$BRANCH" 2>/dev/null || echo 0)
+fi
+
+# Open PR count (gh CLI required)
+OPEN_PR_COUNT="?"
+if command -v gh >/dev/null 2>&1; then
+  REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
+  OWNER_REPO=$(echo "$REMOTE_URL" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+  if [ -n "$OWNER_REPO" ]; then
+    OPEN_PR_COUNT=$(gh pr list --repo "$OWNER_REPO" --state open --json number 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
+  fi
+fi
+
+# Dev claims this cycle (count v* tags this year)
+NOW_YEAR=$(date -u +%Y)
+DEV_CLAIMS_THIS_YEAR=$(git tag -l "v${NOW_YEAR}.*" 2>/dev/null | wc -l | tr -d ' ')
+
+# v4rian mode
+if [ -f .io.v4rian.how-git/MODE ]; then
+  MODE=$(tr -d '\n' < .io.v4rian.how-git/MODE)
+else
+  MODE="connected"
+fi
+
+# Warp mode (bin/warp): lifts the pool -> dev merge policy while on.
+WARP="off"
+if [ -f .io.v4rian.how-git/WARP ] && [ "$(tr -d '[:space:]' < .io.v4rian.how-git/WARP)" = "on" ]; then
+  WARP="on"
+fi
+
+if $JSON; then
+  printf '{"branch":"%s","sha":"%s","seal":"%s","latest_tag":"%s","ahead":%s,"behind":%s,"open_pr_count":"%s","dev_claims_this_year":%s,"mode":"%s","warp":"%s"}\n' \
+    "$BRANCH" "$SHA" "$SEAL" "$LATEST_TAG" "$AHEAD" "$BEHIND" "$OPEN_PR_COUNT" "$DEV_CLAIMS_THIS_YEAR" "$MODE" "$WARP"
+  exit 0
+fi
+
+cat <<EOF
+v4rian status
+  branch:                $BRANCH @ $SHA
+  current version:       $SEAL
+  latest reachable tag:  $LATEST_TAG
+  ahead / behind origin: +$AHEAD / -$BEHIND
+  open PRs (origin):     $OPEN_PR_COUNT
+  dev claims in $NOW_YEAR:    $DEV_CLAIMS_THIS_YEAR
+  mode:                  $MODE
+  warp:                  $WARP
+EOF
+if [ "$WARP" = "on" ]; then
+  echo
+  echo "!! WARP MODE ON: pool -> dev merges skip PR, approval and the who rule (bin/warp off to restore MERGE_POLICY)"
+fi

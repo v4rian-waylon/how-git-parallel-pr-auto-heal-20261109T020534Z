@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# jira-ingress - operator-run JIRA ticket ingress for the v4rian lifecycle.
+#
+# Thin shim that locates the canonical script under scripts/ and forwards
+# every argument verbatim. Matches the bin/ vs scripts/ split the rest of
+# the framework uses: bin/ entries are the operator surface, scripts/ is
+# the implementation. Updating the script body never requires editing this
+# wrapper; updating the wrapper never requires editing the script body.
+#
+# This wrapper exists so an operator at the repo root can type:
+#
+#   .io.v4rian.how-git/bin/jira-ingress --help
+#   .io.v4rian.how-git/bin/jira-ingress --title T --body B --kind feature
+#   .io.v4rian.how-git/bin/jira-ingress --prompt "fix the off-grid e2e seeding"
+#   .io.v4rian.how-git/bin/jira-ingress --prompt "..." --sprint 5
+#   .io.v4rian.how-git/bin/jira-ingress --from-prompt-file ./desc.txt --dry-run
+#
+# instead of remembering the scripts/ path. See the wrapped script's --help
+# for the full flag list, the two operating modes (manual vs claude-driven),
+# the sprint-routing semantics (backlog vs active-sprint -> JIRA Automation
+# allocator dispatch), the off-grid-aware fallbacks, the exit codes, and
+# the Atlassian acli (https://developer.atlassian.com/cloud/acli/)
+# dependency this CLI sits in front of.
+#
+# This CLI is the ingress point for tickets entering the v4rian lifecycle
+# via JIRA. It is NOT the only path into the lifecycle - bin/create-pool-branch
+# also accepts direct admin invocation without any JIRA key, per
+# feedback_jira_is_integration_not_component. jira-ingress exists to
+# support the JIRA-integration path: when an operator wants the ticket to
+# trigger JIRA Automation's gh allocator dispatch on active-sprint creation,
+# the ticket must land in JIRA first; this tool puts it there to spec.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+SCRIPT="$NS_DIR/scripts/jira-ingress.sh"
+
+if [ ! -x "$SCRIPT" ]; then
+  echo "X jira-ingress: canonical script missing or not executable at $SCRIPT" >&2
+  exit 1
+fi
+
+exec bash "$SCRIPT" "$@"

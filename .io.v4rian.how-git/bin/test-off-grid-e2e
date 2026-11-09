@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# test-off-grid-e2e - operator-run wrapper for the off-grid lifecycle test.
+#
+# Thin shim that locates the canonical script under scripts/ and forwards
+# every argument verbatim. Matches the bin/ vs scripts/ split the rest of
+# the framework uses: bin/ entries are the operator surface, scripts/ is
+# the implementation. Updating the script body never requires editing this
+# wrapper; updating the wrapper never requires editing the script body.
+#
+# This wrapper exists so an operator at the repo root can type:
+#
+#   .io.v4rian.how-git/bin/test-off-grid-e2e --help
+#   .io.v4rian.how-git/bin/test-off-grid-e2e --dry-run --token *** --account me
+#   .io.v4rian.how-git/bin/test-off-grid-e2e --token *** --account me
+#   .io.v4rian.how-git/bin/test-off-grid-e2e --token *** --account me --keep
+#
+# instead of remembering the scripts/ path. See the wrapped script's --help
+# for the full flag list, the API call sequence, and the exit codes.
+#
+# This is an OPERATOR-RUN test that creates AND deletes real GitHub repos
+# per invocation. The offline lifecycle suite at .io.v4rian.how-git/
+# framework-tests/test-lifecycle.sh exercises the off-grid refusal/
+# acceptance matrix against scratch repos with no network and is the
+# default CI gate; THIS tool is the operator's escape hatch for proving
+# that off-grid claim ceremonies also work end-to-end against a real
+# throwaway repo where no GitHub workflow fires.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+SCRIPT="$NS_DIR/scripts/test-off-grid-e2e.sh"
+
+if [ ! -x "$SCRIPT" ]; then
+  echo "X test-off-grid-e2e: canonical script missing or not executable at $SCRIPT" >&2
+  exit 1
+fi
+
+exec bash "$SCRIPT" "$@"

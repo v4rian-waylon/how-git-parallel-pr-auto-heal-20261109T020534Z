@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# set-merge-policy - read or change the per-repo pool -> dev merge policy.
+#
+# The policy lives in .io.v4rian.how-git/MERGE_POLICY, committed with the
+# repo, so every clone and every gate applies the same rules. Each change
+# is admin-gated like bin/set-mode and logged as a [MODE] commit. The
+# policy covers pool -> dev only; dev -> main rules are never affected.
+#
+# Keys (defaults keep the behaviour from before the policy existed):
+#   dev_merge_who=anyone|admins|list   who may merge a pool into dev
+#                                      (default admins = admins.txt)
+#   dev_merge_list=a@x,b@x             allowed emails when who=list
+#   dev_merge_pr=required|optional     connected mode: PR required
+#                                      (default required)
+#   dev_merge_approval=none|required   Approved-by trailer from another
+#                                      allowed merger (default none)
+#   dev_merge_gates=name,name          ci-local push checks that must pass
+#                                      before the close-up (default none)
+#   dev_merge_max_commits=N            most commits one pool may bring into
+#                                      dev (default 20, 0 = no cap)
+#
+# bin/warp on lifts who, pr and approval while it is on; gates and the
+# commit cap still run.
+#
+# Usage:
+#   set-merge-policy                       print the policy and warp state
+#   set-merge-policy --get KEY             print one effective-on-disk value
+#   set-merge-policy KEY=VALUE [...]       validate, write, commit [MODE]
+#   set-merge-policy -h | --help           print this help
+#
+# Exit codes:
+#   0  policy printed, value printed, policy unchanged or committed, or help
+#   2  not a git repo, unknown key, invalid value, or list without emails
+#   3  the admin gate refused (connected: not a repo admin or gh unauthenticated)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+case "${1:-}" in -h|--help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -z "$REPO_ROOT" ] && { echo "X set-merge-policy: not inside a git repo" >&2; exit 2; }
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR/scripts/_lib.sh"
+# shellcheck source=../scripts/_merge_policy.sh
+. "$NS_DIR/scripts/_merge_policy.sh"
+
+POLICY_FILE="$REPO_ROOT/.io.v4rian.how-git/MERGE_POLICY"
+
+case "${1:-}" in
+  -h|--help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "")
+    for k in $MP_KEYS; do printf '%s=%s\n' "$k" "$(mp_get "$k")"; done
+    echo "warp=$(warp_state)"
+    exit 0 ;;
+  --get)
+    k="${2:-}"
+    case " $MP_KEYS " in *" $k "*) ;; *) echo "X set-merge-policy: unknown key '$k' (keys: $MP_KEYS)" >&2; exit 2 ;; esac
+    mp_get "$k"; exit 0 ;;
+esac
+
+# Validate every pair before touching the file.
+PAIRS=("$@")
+for pair in ${PAIRS[@]+"${PAIRS[@]}"}; do
+  case "$pair" in *=*) ;; *) echo "X set-merge-policy: expected KEY=VALUE (got '$pair')" >&2; exit 2 ;; esac
+  k="${pair%%=*}"; v="${pair#*=}"
+  case " $MP_KEYS " in *" $k "*) ;; *) echo "X set-merge-policy: unknown key '$k' (keys: $MP_KEYS)" >&2; exit 2 ;; esac
+  mp_valid "$k" "$v" || { echo "X set-merge-policy: invalid value '$v' for $k (see --help)" >&2; exit 2; }
+done
+
+# Compose the resulting policy and check cross-key consistency.
+TMP=$(mktemp "${TMPDIR:-/tmp}/merge-policy.XXXXXX")
+trap 'rm -f "$TMP" "$TMP.n"' EXIT
+if [ -f "$POLICY_FILE" ]; then cp "$POLICY_FILE" "$TMP"; else : > "$TMP"; fi
+for pair in ${PAIRS[@]+"${PAIRS[@]}"}; do
+  k="${pair%%=*}"
+  if grep -q "^$k=" "$TMP"; then
+    # Rewrite the key in place so the documented layout survives.
+    awk -v k="$k" -v line="$pair" 'BEGIN{done=0} index($0, k"=")==1 && !done {print line; done=1; next} {print}' "$TMP" > "$TMP.n"
+    mv "$TMP.n" "$TMP"
+  else
+    printf '%s\n' "$pair" >> "$TMP"
+  fi
+done
+who=$(grep -E '^dev_merge_who=' "$TMP" | tail -1 | cut -d= -f2-)
+list=$(grep -E '^dev_merge_list=' "$TMP" | tail -1 | cut -d= -f2-)
+if [ "$who" = "list" ] && [ -z "$list" ]; then
+  echo "X set-merge-policy: dev_merge_who=list needs a non-empty dev_merge_list" >&2
+  exit 2
+fi
+if cmp -s "$TMP" "$POLICY_FILE" 2>/dev/null; then
+  echo "-> merge policy unchanged"
+  exit 0
+fi
+
+require_repo_admin set-merge-policy "$(get_mode)" "change the merge policy"
+
+cp "$TMP" "$POLICY_FILE"
+cd "$REPO_ROOT"
+git add .io.v4rian.how-git/MERGE_POLICY
+git commit -q -m "[MODE] set merge policy $*" -m "Changes the pool to dev merge policy in .io.v4rian.how-git/MERGE_POLICY. From this commit on, finalize-pool-merge, init-pool-merge and pre-push apply the new values; dev to main rules are unchanged."
+echo "v merge policy committed: $*"

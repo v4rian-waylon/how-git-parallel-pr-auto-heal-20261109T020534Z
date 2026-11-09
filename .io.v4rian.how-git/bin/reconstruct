@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# reconstruct - deterministic mechanics for the git-reconstruct skill:
+# consolidating N separate source projects/zips into one new modularized
+# repo. See .io.v4rian.how-git/skills/git-reconstruct/SKILL.md for the full
+# methodology; this tool implements every step that is pure git/file/build
+# mechanics. Only three subcommands (marked [claude] below) shell out to a
+# claude subprocess, and only for the single named judgment call each -
+# every other subcommand never invokes claude.
+#
+# Usage:
+#   reconstruct identity <source-repo>
+#       Report every distinct real git author identity in a source repo.
+#       Never blends or normalizes what it finds.
+#
+#   reconstruct scaffold <manifest.json> <target-dir>
+#       Create the module/include/src directory convention from a target
+#       module manifest. Structure only, never source content.
+#
+#   reconstruct gaps <manifest.json> <target-dir>
+#       Diff the manifest's catalogued classes against what actually has a
+#       header on disk under target-dir. Reports gaps, never fabricates.
+#
+#   reconstruct audit-structure [repo] [--clone <url>] [--require <path>]...
+#                               [--no-default-docs] [--allow-gaps-before <tag>]
+#       Structural self-audit: every pool/* branch landed on dev (nN, kind
+#       and short slug; a reconcile candidate stands in for its original),
+#       every dev merge has a tag, DEV tags sit on merges and run 1..N
+#       without holes or doubles (.0 seals exempt; holes older than
+#       --allow-gaps-before become notes), README.md and .gitignore (unless
+#       --no-default-docs) and every --require path exist, local dev and
+#       tags match origin. Prefer --clone for a trustworthy result (a
+#       working copy can mask a push gap with local-only refs).
+#
+#   reconstruct scrub <path> <term...>
+#       Remnant sweep per term over the whole repo: tracked content
+#       (file:line), every path any ref ever carried, every commit message,
+#       every commit whose diff adds or removes the term, every ref name and
+#       every author or committer identity. Reports every hit and the count;
+#       never judges disposition.
+#
+#   reconstruct preflight <repo> [reason] [--allow-unpushed]
+#       Back up before any destructive step. Runs the machine's how-preflight
+#       hook when installed (RECONSTRUCT_PREFLIGHT_HOOK, default
+#       ~/.claude/hooks/git-preflight.sh, empty disables it), so the backups
+#       land where its destructive-git guard looks, and adds a bundle of
+#       every ref beside the hook's zip. Without the hook it takes the same
+#       backups itself (preflight-bak-<day>/NN ref, <name>-bak-<stamp>.zip
+#       and .bundle under RECONSTRUCT_BAK_DIR, else BAKS_DIR, else
+#       <repo parent>/baks, mirrored to BAKS_MIRROR) and says where. A
+#       backup ref origin refuses fails the preflight unless --allow-unpushed
+#       (which warns that no off-machine copy exists).
+#
+#   reconstruct relocate <repo> <subdir>
+#       Move a fully-built repo's entire history into a subdirectory via
+#       git-filter-repo (pinned release fetched when not on PATH). Takes
+#       exactly two arguments; refuses a path that is not the root of a repo
+#       with its own .git directory (inherited GIT_DIR and linked worktrees
+#       included), a dash-prefixed subdir, uncommitted tracked changes and
+#       branches behind or diverged from origin; keeps unpushed commits;
+#       takes a preflight first; afterwards every branch and commit tag must
+#       have a new SHA whose tree holds <subdir>/ alone (tags on trees or
+#       blobs are noted), else it exits 1.
+#
+#   reconstruct fast-forward <org>/<new-throwaway-name> [--dry-run]
+#       Push the current working clone's dev, main, pool/*, feature/*,
+#       safety/*, vault/* and every tag, verbatim and atomically, to a
+#       brand-new throwaway repo, authenticating through gh's credential
+#       helper (no token in .git/config), then read every ref back.
+#       --dry-run (or LIFECYCLE_TEST_MODE=1) prints the plan offline.
+#
+#   reconstruct verify-artifacts <manifest.json> [--all]
+#       Loop over every artifact in a manifest and run its build/link
+#       command. Fail-fast by default (matches the documented step);
+#       --all collects every failure instead of stopping at the first.
+#
+#   reconstruct infer-rename <old-symbol> <catalog.json>          [claude]
+#       Rename-only naming/namespace normalization against a target
+#       catalog. Prints 'RENAME: <NewName>' or 'QUESTION: <ambiguity>'.
+#
+#   reconstruct check-reusability <file>                          [claude]
+#       Genuine-reusability filter. Prints 'REUSABLE' or 'EXCLUDE: <why>'.
+#
+#   reconstruct review-scrub-hit <file> <term>                    [claude]
+#       Classifies an ambiguous scrub hit. Prints 'LEAK: <fix>' or
+#       'NOT-A-LEAK: <why>'.
+#
+#   reconstruct -h | --help
+#
+# Env:
+#   LIFECYCLE_TEST_MODE=1   Every [claude] subcommand emits a canned,
+#                           deterministic answer derived from the real
+#                           input shape instead of calling claude. Also
+#                           forces fast-forward into --dry-run. Mirrors
+#                           the test-mode contract every other framework
+#                           script uses.
+#
+# Exit codes: 0 success, 1 the check/verification failed (gaps,
+# audit-structure, scrub, relocate, fast-forward, verify-artifacts) or a
+# [claude] answer broke its one line contract, 2 usage error, 3 claude CLI
+# unavailable.
+
+set -uo pipefail
+
+# The library ships next to this binary; resolve it from here, never from the
+# caller's cwd, so the tool runs by absolute path from a source repo or from
+# outside any repo. Subcommands that need a repo check for one themselves.
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 2
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
+# shellcheck source=../scripts/reconstruct.sh
+. "$SELF_DIR/../scripts/reconstruct.sh" || exit 2
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+SUBCOMMAND="$1"; shift
+
+case "$SUBCOMMAND" in
+  identity)             reconstruct_identity "$@" ;;
+  scaffold)             reconstruct_scaffold "$@" ;;
+  gaps)                 reconstruct_gaps "$@" ;;
+  audit-structure)      reconstruct_audit_structure "$@" ;;
+  scrub)                reconstruct_scrub "$@" ;;
+  preflight)            reconstruct_preflight "$@" ;;
+  relocate)             reconstruct_relocate "$@" ;;
+  fast-forward)         reconstruct_fast_forward "$@" ;;
+  verify-artifacts)     reconstruct_verify_artifacts "$@" ;;
+  infer-rename)         reconstruct_infer_rename "$@" ;;
+  check-reusability)    reconstruct_check_reusability "$@" ;;
+  review-scrub-hit)     reconstruct_review_scrub_hit "$@" ;;
+  -h|--help)            usage ;;
+  *) echo "X reconstruct: unknown subcommand: $SUBCOMMAND" >&2; usage >&2; exit 2 ;;
+esac

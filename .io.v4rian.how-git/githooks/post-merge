@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# post-merge - auto-claim version after a successful merge into dev or main.
+#
+# Fires after `git pull` (or `git merge`) brings a new merge commit onto
+# dev or main, so the moment the merger pulls after a GitHub-UI PR merge
+# the claim script runs automatically. No human-typed `bash claim-*.sh`
+# step is required.
+#
+# Triggers:
+#   HEAD on `dev`  + latest commit is NOT a chore(version): bump
+#     → runs scripts/claim-dev-merge.sh --skip-pull
+#   HEAD on `main` + latest commit is NOT a chore(version): bump
+#     → runs scripts/claim-main-release.sh --skip-pull
+#   Anywhere else → no-op (working branches don't claim)
+#
+# Skips squash merges (argument $1 == 1) - squash collapses the source's
+# commits into a single new commit on the target, making the version
+# claim ambiguous; in that rare case the user should run the claim
+# script manually with the right semantics for their team.
+#
+# Skips bump commits (`chore(version): ...`) - those ARE the previous
+# claim's bump commit landing locally via pull, not a new PR merge.
+# Without this guard pulling a remote-side bump would re-claim and
+# create duplicate tags.
+
+set -euo pipefail
+
+# $1 is "1" if this is a squash merge, "0" for a true merge / fast-forward
+SQUASH="${1:-0}"
+if [ "$SQUASH" = "1" ]; then
+  echo "post-merge: squash detected; skipping auto-claim (run claim script manually)"
+  exit 0
+fi
+
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+case "$BRANCH" in
+  dev|main) ;;
+  *) exit 0 ;;
+esac
+
+# Detect bump commits from prior claims so we don't re-claim them.
+SUBJ=$(git log -1 --format='%s' HEAD)
+case "$SUBJ" in
+  chore\(version\):*)
+    exit 0
+    ;;
+esac
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+# In a linked worktree git exports GIT_DIR=<repo>/.git/worktrees/<wt> to
+# hooks. Hand the claim a plain environment rooted at the work tree so
+# every script below discovers the repo from its cwd, never from the
+# exported variables (G2).
+cd "$REPO_ROOT"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+NS_DIR=".io.v4rian.how-git"
+SCRIPTS="$REPO_ROOT/$NS_DIR/scripts"
+
+# Mode gate. In connected mode the claim ceremonies are CI-driven and the
+# scripts refuse to run locally with an X message (exit 0 but cosmetically
+# noisy on every git pull onto dev or main). Skip the local invocation in
+# connected mode so the operator sees a quiet pull. Only off-grid runs
+# the claim scripts locally; CI handles the rest.
+#
+# LIFECYCLE_TEST_MODE=1 bypasses the connected-mode skip so the framework
+# tests that simulate the local claim pipeline can still drive the hook
+# end-to-end without flipping every scratch repo to off-grid first.
+. "$SCRIPTS/_lib.sh"
+MODE_VAL=$(get_mode 2>/dev/null || echo "connected")
+if [ "$MODE_VAL" != "off-grid" ] && [ "${LIFECYCLE_TEST_MODE:-}" != "1" ]; then
+  exit 0
+fi
+
+case "$BRANCH" in
+  dev)
+    echo "post-merge: dev tip moved, auto-running claim-dev-merge.sh"
+    if [ -x "$SCRIPTS/claim-dev-merge.sh" ]; then
+      bash "$SCRIPTS/claim-dev-merge.sh" --skip-pull
+    else
+      echo "post-merge: $SCRIPTS/claim-dev-merge.sh missing or not executable; skipping" >&2
+    fi
+    ;;
+  main)
+    echo "post-merge: main tip moved, auto-running claim-main-release.sh"
+    if [ -x "$SCRIPTS/claim-main-release.sh" ]; then
+      bash "$SCRIPTS/claim-main-release.sh" --skip-pull
+    else
+      echo "post-merge: $SCRIPTS/claim-main-release.sh missing or not executable; skipping" >&2
+    fi
+    ;;
+esac

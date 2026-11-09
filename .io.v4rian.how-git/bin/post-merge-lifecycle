@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# post-merge-lifecycle - operator-run wrapper for the post merge
+# lifecycle completion pass.
+#
+# Thin shim that locates the canonical script under scripts/ and forwards
+# every argument verbatim, matching the bin/ vs scripts/ split the rest
+# of the framework uses. The pass archives merged pools to vault and
+# publishes reconcile candidates, with every push riding the admin
+# operator's own gh session credentials - no token inputs, no secrets.
+#
+#   .io.v4rian.how-git/bin/post-merge-lifecycle --help
+#   .io.v4rian.how-git/bin/post-merge-lifecycle --dry-run
+#   .io.v4rian.how-git/bin/post-merge-lifecycle
+set -euo pipefail
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec bash "$SCRIPT_DIR/../scripts/post-merge-lifecycle.sh" "$@"

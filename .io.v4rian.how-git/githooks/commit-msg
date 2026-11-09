@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# commit-msg - cheap, deterministic message guardrail.
+#
+# Under the commit stage model (Step 2 of the lifecycle) the heavy commit
+# auditing lives outside this hook: the smart auto-fix layer runs at
+# prepare-commit-msg (message rewrites) and pre-commit (staged file
+# scrubs), and the compile / coverage / runtime audits run async in CI via
+# .github/workflows/ci-dispatch.yml. This hook keeps the checks that cost
+# nothing and never rewrite anything:
+#
+#   1. Subject length within bounds. Hand-written commits stay at 8-100
+#      chars to keep kernel-style discipline. Auto-generated subjects from
+#      the claim flow and the allocator carry the full pool ref name plus
+#      a version segment; under the pool/vYYYY.MAIN/ prefix layout those
+#      subjects overflow 100 chars even with short slugs, so the two
+#      machine-generated prefixes are allowed up to 140 chars.
+#   2. Subject shape (scripts/_lib.sh hg_subject_violations): an approved
+#      [TAG] then one space; sentence case after the human tags.
+#   3. The message rules from scripts/_lib.sh hg_message_violations: no em
+#      or en dash, no "plus" in prose, no Co-Authored-By: Claude trailer,
+#      whatever the subject prefix ([MERGE] and [REQ] included). The
+#      auto-fix normally repairs these before this hook runs; when the
+#      operator switched it off (HOW_GIT_AUTOFIX=0 or git config
+#      howgit.autofix false) this is where the rules are enforced.
+#   4. Identity guardrail (ruling 6): when the origin's GitHub org is mapped
+#      (bin/identity), author and committer must be the mapped identity: the
+#      email exactly, the name as the map writes it (a <Model> slot takes any
+#      model or none). In a real CI run (GITHUB_ACTIONS=true with a
+#      GITHUB_RUN_ID) the workflow's configured bot identity also passes.
+#      Joel's own identity passes only under the snapshot-rebuild switch
+#      (HOW_GIT_SNAPSHOT_REBUILD=1 or how-git.snapshotRebuild). A rewrite that
+#      keeps a foreign original author sets HOW_GIT_PRESERVE_AUTHOR=1; pre-push
+#      then proves the author really is the original one.
+
+set -euo pipefail
+
+msg_file="$1"
+subj=$(head -n1 "$msg_file")
+len=${#subj}
+
+case "$subj" in
+  "[MERGE] "*|"[REQ] "*) max=140 ;;
+  *)                     max=100 ;;
+esac
+
+if (( len < 8 || len > max )); then
+  echo "X Commit subject must be 8-${max} chars (got $len)"
+  echo "  Subject: $subj"
+  exit 1
+fi
+
+# The identity git records for this commit, read before _lib.sh is sourced:
+# _lib.sh exports the mapped identity when none is set, which would make the
+# gate below check its own export instead of what the commit carries.
+_ident() { git var "$1" 2>/dev/null | sed 's/ [0-9][0-9]* [-+][0-9]*$//'; }
+committer_ident=$(_ident GIT_COMMITTER_IDENT)
+author_ident=$(_ident GIT_AUTHOR_IDENT)
+
+HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../scripts/_lib.sh
+. "$HOOK_DIR/../scripts/_lib.sh"
+
+# Subject shape: an approved [TAG], sentence case after human tags. A merge
+# in progress is left to the merge-message checker below (dev and main) or
+# to git's own subject on topic branches; a rebase or cherry-pick replay
+# re-commits a message already written, as the auto-fix also assumes.
+if [ ! -f "$(git rev-parse --git-dir 2>/dev/null || echo .git)/MERGE_HEAD" ] \
+   && ! hg_replay_in_progress \
+   && ! shape=$(hg_subject_violations "$subj"); then
+  echo "X Commit subject breaks the shape rule: $shape"
+  echo "  Subject: $subj"
+  exit 1
+fi
+
+if ! violations=$(hg_message_violations "$msg_file" strip-comments); then
+  echo "X Commit message breaks the message rules:"
+  printf '%s\n' "$violations" | sed 's/^/  - /'
+  echo "  Fix the message and commit again (the auto-fix repairs these unless switched off)."
+  exit 1
+fi
+
+# shellcheck source=../scripts/lib/identity.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../scripts/lib/identity.sh"
+committer=$(printf '%s' "$committer_ident" | sed -n 's/.*<\(.*\)>.*/\1/p')
+author=$(printf '%s' "$author_ident" | sed -n 's/.*<\(.*\)>.*/\1/p')
+rc=0; identity_email_allowed "$committer" || rc=$?
+[ "$rc" -ne 0 ] || identity_name_allowed "${committer_ident% <*}" "$committer" || rc=1
+if [ "$rc" -eq 1 ]; then
+  echo "X Committer $committer_ident is not this repo's identity <$(identity_expected_email)>"
+  echo "  Fix: eval \"\$(.io.v4rian.how-git/bin/identity --export)\""
+  exit 1
+fi
+if [ "$rc" -eq 0 ] && [ "${HOW_GIT_PRESERVE_AUTHOR:-0}" != "1" ]; then
+  arc=0; identity_email_allowed "$author" || arc=$?
+  [ "$arc" -ne 0 ] || identity_name_allowed "${author_ident% <*}" "$author" || arc=1
+  if [ "$arc" -eq 1 ]; then
+    echo "X Author $author_ident is not this repo's identity <$(identity_expected_email)>"
+    echo "  Fix: eval \"\$(.io.v4rian.how-git/bin/identity --export)\"; rewrites of a"
+    echo "  foreign original set HOW_GIT_PRESERVE_AUTHOR=1 (pre-push verifies it)"
+    exit 1
+  fi
+fi
+# Merge message shape (git-merge-audit rule 5). Checked for every [MERGE]
+# subject (hand-written merges and the claim's amend, whose body opens with
+# the "PR #N <url>" reference paragraph) and for every merge commit being
+# created on dev or main, so a default "Merge branch ..." subject cannot land
+# there either. The checker resolves next to this hook so any hooksPath
+# pointing at this directory finds it.
+hook_dir=$(cd "$(dirname "$0")" && pwd)
+checker="$hook_dir/../scripts/check-merge-message.sh"
+git_dir=$(git rev-parse --git-dir 2>/dev/null || echo .git)
+branch=$(git symbolic-ref --short -q HEAD 2>/dev/null || true)
+check_merge=false
+case "$subj" in "[MERGE] "*) check_merge=true ;; esac
+if [ -f "$git_dir/MERGE_HEAD" ] && [[ "$branch" =~ ^(dev|main)$ ]]; then
+  check_merge=true
+fi
+if $check_merge; then
+  bash "$checker" --file "$msg_file" --pr-ref || exit 1
+fi
+exit 0

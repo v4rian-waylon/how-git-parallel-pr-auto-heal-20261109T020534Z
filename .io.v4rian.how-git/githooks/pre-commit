@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# pre-commit - staged-file content scrub for em-dashes and banned tokens.
+#
+# Fires before the commit is recorded, after staging. Scrubs every staged
+# text file in place (working tree + index) for the same characters and
+# tokens that prepare-commit-msg removes from the commit message, so the
+# repo content and the message stay in lockstep on the auto-fix rules.
+#
+# Pipeline:
+#
+#   1. Enumerate staged text files. Skip binaries (the staged blob's
+#      first 8 KB are scanned for a NUL byte).
+#   2. Skip files under .git/, node_modules/, build/, build-*/, vendor
+#      dirs, and the auto-fix library itself (which intentionally
+#      contains the dash characters as regex data).
+#   3. Apply the dash rule by file type (hg_dash_rule_applies in
+#      scripts/_lib.sh, shared with the CI commit-audit dash gate): prose
+#      files (markdown, text, reStructuredText, AsciiDoc, Org, README-style
+#      docs) get em-dashes (U+2014) and en-dashes (U+2013) replaced with
+#      hyphens and are re-staged. Code and data are never rewritten: a
+#      dash inside a string literal or a regex is semantics, not prose.
+#      Code files that carry a dash get a one-line note and keep it.
+#   4. If any file was rewritten, surface a one-line note per file so
+#      the author can see what changed before the editor opens.
+#
+#   5. On the framework source (FRAMEWORK_REPO marker) run
+#      scripts/lint-protocol.sh --staged: a staged skill, protocol doc
+#      or allocator change that adds a memory link, a dead reference, a
+#      retired phrase, a fixed /tmp path or a kind list drifting from
+#      _lib.sh blocks the commit. Findings on lines the commit does not
+#      touch stay with the CI run over the whole namespace.
+#
+# The scrub never blocks the commit: it augments the diff and lets git
+# commit proceed; if the author dislikes the rewrite they can git reset
+# HEAD and commit the original. Only the protocol lint (step 5) blocks.
+
+set -uo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+# shellcheck source=../scripts/_lib.sh
+. "$REPO_ROOT/.io.v4rian.how-git/scripts/_lib.sh"
+
+# Files to skip even if staged.
+_skip_path() {
+  local p="$1"
+  case "$p" in
+    .git/*|*/node_modules/*|*/build/*|*/build-*/*|*/vendor/*|*/.venv/*) return 0 ;;
+    .io.v4rian.how-git/scripts/lib/auto-fix-commit-message.sh) return 0 ;;
+    .io.v4rian.how-git/githooks/pre-commit) return 0 ;;
+    .io.v4rian.how-git/test/test-hooks.sh) return 0 ;;
+    .io.v4rian.how-git/test/test-lifecycle.sh) return 0 ;;
+    .io.v4rian.how-git/framework-tests/test-hooks.sh) return 0 ;;
+    .io.v4rian.how-git/framework-tests/test-lifecycle.sh) return 0 ;;
+    .io.v4rian.how-git/scripts/audits/commit-audit.sh) return 0 ;;
+  esac
+  return 1
+}
+
+# Return 0 if the file looks like text.
+#
+# Earlier revisions tried `head -c 8192 "$p" | LC_ALL=C grep -q $'\x00'` to
+# detect a NUL byte, but bash's $'\x00' expansion is empty under most locales
+# (the shell cannot embed a literal NUL in a string argument), so grep ran with
+# an empty pattern, matched every line, and the helper reported every staged
+# file as binary. That silently disabled the em-dash scrub for every commit.
+#
+# `file -b --mime-encoding` is the canonical portable check: macOS ships it
+# (BSD file 5.x), GNU file emits the same mime-encoding tokens, and the
+# `binary` token covers the same NUL-byte heuristic the original guard tried
+# to express, plus the wider set of non-UTF binary encodings. An empty file
+# is reported as `binary` by `file`, which is fine here because the scrub
+# loop downstream has its own grep guard and gains nothing from rewriting an
+# empty file anyway.
+_is_text_file() {
+  local p="$1"
+  [ -f "$p" ] || return 1
+  local enc
+  enc=$(file -b --mime-encoding "$p" 2>/dev/null)
+  [ -n "$enc" ] && [ "$enc" != "binary" ]
+}
+
+# Collect staged file paths (relative to repo root). --cached --diff-filter=ACMRT
+# excludes deletions so we never try to rewrite something git no longer tracks.
+staged_files=$(git diff --cached --name-only --diff-filter=ACMRT 2>/dev/null)
+
+rewritten_count=0
+rewritten_paths=()
+kept_paths=()
+
+while IFS= read -r relpath; do
+  [ -z "$relpath" ] && continue
+  if _skip_path "$relpath"; then
+    continue
+  fi
+  abspath="$REPO_ROOT/$relpath"
+  if ! _is_text_file "$abspath"; then
+    continue
+  fi
+  # Scan for em-dash or en-dash. Fast path: skip if neither present.
+  if ! LC_ALL=C grep -q -e $'\xe2\x80\x94' -e $'\xe2\x80\x93' "$abspath" 2>/dev/null; then
+    continue
+  fi
+  if ! hg_dash_rule_applies "$relpath" "$REPO_ROOT"; then
+    kept_paths+=("$relpath")
+    continue
+  fi
+  # Rewrite in place (hg_scrub_prose_file, a python pass portable across
+  # BSD and GNU). Fenced code blocks inside markdown keep their bytes.
+  hg_scrub_prose_file "$abspath"
+  # Re-stage the rewritten file so the commit captures the cleaned content.
+  git add -- "$abspath" >/dev/null 2>&1 || true
+  rewritten_count=$((rewritten_count + 1))
+  rewritten_paths+=("$relpath")
+done <<< "$staged_files"
+
+if [ "$rewritten_count" -gt 0 ]; then
+  echo ">> pre-commit auto-fix scrubbed em-dashes / en-dashes in $rewritten_count file(s):" >&2
+  for p in ${rewritten_paths[@]+"${rewritten_paths[@]}"}; do
+    echo "   $p" >&2
+  done
+fi
+if [ "${#kept_paths[@]}" -gt 0 ]; then
+  echo ">> pre-commit kept em/en-dashes in code, data, or the vendored copy (not rewritten, by design):" >&2
+  for p in ${kept_paths[@]+"${kept_paths[@]}"}; do
+    echo "   $p" >&2
+  done
+fi
+
+# Framework source only (FRAMEWORK_REPO marker): a consumer vendors the
+# namespace as a whole and is not gated on the framework's own text.
+LINT="$REPO_ROOT/.io.v4rian.how-git/scripts/lint-protocol.sh"
+if [ -f "$LINT" ] && [ -f "$REPO_ROOT/.io.v4rian.how-git/FRAMEWORK_REPO" ]; then
+  if ! lint_out=$(bash "$LINT" --root "$REPO_ROOT" --staged 2>&1); then
+    echo "X pre-commit: the protocol lint failed on lines this commit adds:" >&2
+    printf '%s\n' "$lint_out" | sed 's/^/   /' >&2
+    exit 1
+  fi
+fi
+
+exit 0

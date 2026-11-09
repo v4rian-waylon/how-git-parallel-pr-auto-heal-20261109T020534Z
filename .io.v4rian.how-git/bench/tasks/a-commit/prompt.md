@@ -1,0 +1,1 @@
+The working tree on the current pool branch holds a finished, tested change: `src/sum.sh` (a helper that prints the sum of its two integer arguments) and `tests/sum_test.sh` (its test; run it with `bash tests/sum_test.sh`). Land this change as one atomic commit on the current branch, per the protocol, and push the branch.

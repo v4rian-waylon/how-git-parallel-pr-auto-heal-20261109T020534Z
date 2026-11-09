@@ -4,6 +4,8 @@ The v4rian git template's release history, in human readable form. Each section 
 
 ## Unreleased
 
+Parallel-PR canary tag negative side A.
+
 Parallel-PR canary tag positive side A.
 
 Replaces the auto-rebase reconcile branch's rename plus tmp plus delete dance with a force-push rolling pointer. A reconcile candidate is machine-owned rewritable state, not developer history, so on every dev advance the pass rebuilds it from scratch against the new dev tip and force-pushes the canonical `pool/*.reconcile.*` name in place. The old atomic-vacate to a tmp slot could not run on a repo without the CI bot App enrolled, because deleting a pool ref needed a bypass identity the plain workflow token lacked, so a second dev advance under an open PR left the message "could not atomically rename the prior reconcile branch". The force-push needs no bypass and no admin: `pool-creations` carves reconcile out so the first cut lands, `pool-deletions` only fires on a delete and never on an update, and the no-force rule binds only the developer's own pool branch, never the machine-owned candidate. CI never deletes a pool ref. The developer's own `pool/*` branch is never force-pushed. The lifecycle suite gains `auto-rebase reconcile force-pushes candidate (not delete)` plus an end to end iterative proof, scopes the never-force-push gate to the developer branch, and keeps the `pool-deletions` lock covering every pool ref.
